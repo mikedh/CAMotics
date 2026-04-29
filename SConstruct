@@ -21,8 +21,7 @@ except BaseException as E:
     print(f"Not on Debian or no `apt install lsb-release: `{E}`")
     distro_code = None
 
-# True, except on newer debian with the libnode-dev issue
-default_tpl = distro_code not in {'plucky', 'trixie'}
+default_tpl = True
 
 
 # Setup
@@ -38,7 +37,7 @@ env.CBAddVariables(
     ('python_version', 'Set python version', '3'),
     BoolVariable('with_tpl', 'Enable TPL', default_tpl),
     BoolVariable('with_gui', 'Enable graphical user interface', True),
-    BoolVariable('wrap_glibc', 'Enable GlibC function wrapping', False)
+    BoolVariable('wrap_glibc', 'Enable GlibC function wrapping', False),
     EnumVariable('cxxstd', 'Set C++ language standard', 'c++17',
       allowed_values = ('c++14', 'c++17', 'c++20')),
     )
@@ -408,7 +407,10 @@ if 'package' in COMMAND_LINE_TARGETS:
                                 'libqt5websockets5']}
         # use exact versions for the other distros
         qt_lookup['plucky'] = qt_lookup['noble']
+        qt_lookup['questing'] = qt_lookup['noble']
+        qt_lookup['resolute'] = qt_lookup['noble']  # Ubuntu 26.04
         qt_lookup['trixie'] = qt_lookup['noble']
+        qt_lookup['forky'] = qt_lookup['noble']
         qt_lookup['bookworm'] = qt_lookup['jammy']
         qt_lookup['buster'] = qt_lookup['jammy']
 

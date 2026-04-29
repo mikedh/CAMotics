@@ -20,10 +20,8 @@ RUN apt-get update && \
 WORKDIR /root
 
 ############################################
-# clone and build cbang
+# clone and build cbang at HEAD to match upstream CAMotics API expectations
 RUN git clone --depth=1 https://github.com/CauldronDevelopmentLLC/cbang.git
-RUN cd cbang && \
-    git checkout d4dd5f52b0d5ee499ec5683f5930b01fdb24884b
 # `v8` is provided by libnode-dev
 RUN scons -C cbang v8_compress_pointers=false
 # assign the environment variable for cbang

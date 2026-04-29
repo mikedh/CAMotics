@@ -36,16 +36,17 @@ build_deps = {
 
 # keyed as docker image : build deps
 images = {
-    "ubuntu:25.04": build_deps,  # plucky : TODO : cbang can't find v8.h despite installing libnode-dev
-    "ubuntu:24.04": build_deps,  # noble
-    "ubuntu:22.04": build_deps,  # jammy
-    "debian:trixie": build_deps,  # : TODO : same issue as plucky
-    "debian:bookworm": build_deps,
-    "debian:bullseye": build_deps,
+    "ubuntu:26.04": build_deps,  # resolute (LTS)
+    "ubuntu:25.04": build_deps,  # plucky
+    "ubuntu:24.04": build_deps,  # noble (LTS)
+    "ubuntu:22.04": build_deps,  # jammy (LTS)
+    "debian:trixie": build_deps,  # 13
+    "debian:bookworm": build_deps,  # 12
+    "debian:bullseye": build_deps,  # 11
 }
 
 # debugging: test with just one image
-# k = "debian:trixie"
+# k = "ubuntu:26.04"
 # images = {k: images[k]}
 
 if __name__ == "__main__":
