@@ -125,6 +125,10 @@ namespace GCode {
     void setPathMode(path_mode_t mode, double motionBlending = 0,
                      double naiveCAM = 0);
 
+    // Distance mode
+    void setIncrementalDistanceMode(bool enable);
+    void setArcIncrementalDistanceMode(bool enable);
+
     // Position
     double getAxisCSOffset(char axis, unsigned cs = 0) const;
     double getAxisToolOffset(char axis) const;

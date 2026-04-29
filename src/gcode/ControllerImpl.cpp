@@ -195,6 +195,7 @@ void ControllerImpl::input(unsigned index, bool digital, input_mode_t mode,
 void ControllerImpl::setPlane(plane_t plane) {
   if (VW < plane) THROW("Invalid plane: " << plane);
   state.plane = plane;
+  set("_plane", plane, NO_UNITS);
 }
 
 
@@ -204,6 +205,18 @@ void ControllerImpl::setPathMode(path_mode_t mode, double motionBlending,
   state.motionBlendingTolerance = motionBlending;
   state.naiveCamTolerance = naiveCAM;
   machine.setPathMode(mode, motionBlending, naiveCAM);
+}
+
+
+void ControllerImpl::setIncrementalDistanceMode(bool enable) {
+  state.incrementalDistanceMode = enable;
+  set("_incremental_distance_mode", enable, NO_UNITS);
+}
+
+
+void ControllerImpl::setArcIncrementalDistanceMode(bool enable) {
+  state.arcIncrementalDistanceMode = enable;
+  set("_arc_incremental_distance_mode", enable, NO_UNITS);
 }
 
 
@@ -765,7 +778,7 @@ void ControllerImpl::end() {
   setPlane(XY);
 
   // Distance mode is set to absolute mode (G90)
-  state.incrementalDistanceMode = false;
+  setIncrementalDistanceMode(false);
 
   // Feed rate mode is set to units per minute (G94)
   setFeedMode(UNITS_PER_MINUTE);
@@ -1140,10 +1153,10 @@ bool ControllerImpl::execute(const Code &code, int vars) {
 
     case 890: drill(vars, true, true, false);   break; // Dwell, feed out
 
-    case 900: state.incrementalDistanceMode    = false; break;
-    case 901: state.arcIncrementalDistanceMode = false; break;
-    case 910: state.incrementalDistanceMode    = true;  break;
-    case 911: state.arcIncrementalDistanceMode = true;  break;
+    case 900: setIncrementalDistanceMode(false);    break;
+    case 901: setArcIncrementalDistanceMode(false); break;
+    case 910: setIncrementalDistanceMode(true);     break;
+    case 911: setArcIncrementalDistanceMode(true);  break;
 
     case 920: setGlobalOffsets(vars, true); break;
     case 921: resetGlobalOffsets(true);     break;

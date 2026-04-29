@@ -49,8 +49,10 @@ string Simulation::computeHash() const {
   stream.push(boost::ref(digest));
   stream.push(io::null_sink());
 
-  JSON::Writer writer(stream);
-  write(writer);
+  { // Deallocate JSON::Writer before call to stream.reset()
+    JSON::Writer writer(stream);
+    write(writer);
+  }
 
   stream.reset();
 
