@@ -2,8 +2,8 @@ name: Debian Packages
 
 on:
   push:
-    tags:
-      - '*-release'
+    branches:
+      - master
 
 permissions:
   contents: read
