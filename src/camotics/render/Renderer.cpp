@@ -76,9 +76,12 @@ void Renderer::render(CutWorkpiece &cutWorkpiece, GridTree &tree,
       while (!jobGrids.empty() && jobs.size() < threads) {
         SmartPointer<RenderJob> job =
           new RenderJob(*this, cutWorkpiece, mode, jobGrids.back());
-        job->start();
-        jobs.push_back(job);
         jobGrids.pop_back();
+        // WASM/no-pthread builds pass threads<=1: run the job inline on the
+        // calling thread instead of spawning a cb::Thread. Native multi-thread
+        // builds (threads>1) are unchanged.
+        if (threads <= 1) job->run();
+        else {job->start(); jobs.push_back(job);}
       }
 
       // Reap completed jobs
@@ -112,8 +115,8 @@ void Renderer::render(CutWorkpiece &cutWorkpiece, GridTree &tree,
                  << " ETA: " << TimeInterval(task.getETA()));
       }
 
-      // Wait
-      timedWait(0.1);
+      // Wait (only meaningful when worker threads are running)
+      if (1 < threads) timedWait(0.1);
     }
   } CATCH_ERROR;
 

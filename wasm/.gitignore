@@ -1,0 +1,18 @@
+# Third-party clones fetched per build environment (large; see NOTES.md to set up)
+/cbang/
+/emsdk/
+/libexpat/
+
+# Emscripten build objects + archives
+/wobj/
+
+# Python e2e environment + generated test output
+/e2e/.venv/
+/e2e/__pycache__/
+/e2e/artifacts/
+
+# Logs and generated reference/demo data + native helper binary
+*.log
+/real_*.json
+/real_*.stl
+/path2json
