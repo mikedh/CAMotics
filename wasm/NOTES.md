@@ -116,7 +116,162 @@ with Playwright + headless Chromium.
   scorpion.nc -> 295,772 tris, 270 moves, 85.2s, ~1.7s in-browser.
 - To view: `python3 wasm/serve_dev.py` then open http://localhost:8000
 
+## [DONE v3] parcel2+preact+ts viewer + GPU time-scrub (two render modes)
+- Frontend migrated to parcel2 + preact + typescript under `wasm/app/` (the
+  vanilla `wasm/viewer/` is kept only for the legacy e2e). Build: `npm run build`
+  in wasm/app -> dist/. Serve no-cache: `python serve_dist.py` (or e2e servers).
+- Three render modes (toolbar "Render"): **Cut (analytic)** [default], **Volume
+  (field)**, **Mesh**. C++ edits -> `bash build_wasm.sh` then copy
+  `viewer/camotics.{js,wasm}` to `app/src/wasm/`, then `npm run build`.
+
+### Cut (analytic) — squirm-free, crisp tool walls  [the v3 payoff]
+The voxel "removalTime" field (Volume mode) renders the level-set {g==scrubTime};
+because g is interpolated, that surface SQUIRMS as you scrub. The analytic mode
+removes the squirm entirely by evaluating the cut as a GPU SDF:
+
+    solid(p, s) = stockBox(p)  MINUS  union of tool sweeps with tStart <= s
+
+A point is removed exactly when the swept tool first reaches it -> the surface
+only changes where/when the tool touches (no squirm), and walls are the true tool
+envelope (capsule / swept-cone / sphere-swept) with analytic SDF-gradient normals
+(crisp, tool-shaped). In-progress moves are clipped to the point the tool has
+actually reached (continuous; no reliance on g-code segment granularity).
+
+- C++ `Sim::bakeCut(gcode,resMode)` (wasm/glue.cpp) exports, via embind typed
+  views: moves [x0,y0,z0,x1,y1,z1,tStart,tEnd,toolIdx], tool table
+  [shape,radius,length,snubR], stock bounds, duration, and a UNIFORM-GRID CSR
+  (cellStart/cellMoves) binning each move by its swept bbox (~64 cells on the
+  longest axis). Tool-shape math from src/camotics/sim/{ConicSweep,SpheroidSweep}.
+- `wasm/app/src/cutShader.ts`: GLSL3 raymarch. Data textures (RAW mm coords):
+  u_moves RGBA32F 3 texels/move, u_cellStart/u_cellMoves R32F, u_tools vec4[].
+  Per sample: grid cell -> iterate that cell's moves -> min swept-tool SDF, time
+  gated + clipped; sphere-trace; SDF-gradient normal; cheap SDF ambient occlusion
+  for groove depth. Scrub = one uniform write (u_scrubAbs, absolute seconds).
+- `wasm/app/src/viewer.ts` `renderCut()` builds the textures + box + ShaderMaterial.
+- Verified: `test_cut.py` (squirm metric: adjacent-frame change <6% and confined to
+  a <30% bbox around the tool -> measured 0.3% / 10%), PASS 7/7. `test_volume.py`
+  (the field-mode regression, selects Volume) PASS 8/8. `e2e_smoke.py` PASS.
+- Perf (swiftshader CPU = ~10-15x slower than real GPU): scorpion 8ms, heart 20ms,
+  compass 16ms; vcarve (3731 dense overlapping moves, ~199/cell) ~180ms — the
+  pathological case; Volume mode (bakes once) is the fallback there.
+- Dev harnesses: probe_cut.py (export stats), shot_cut.py (screenshots),
+  perf_cut.py (frame timing), test_cut.py (the squirm contract).
+
+### Cut v3.1 — correctness + sidewall + perf-aware pass
+- **Plunge/steep-move bug ("solid material at the shaft"):** `toolDist` projected p
+  onto the 3D segment, so on a vertical/steep move `axis.z≈p.z` -> `h≈0` -> the
+  z-slab `max(-h,h-len)` collapsed to 0 and interior points read as *on the surface*
+  (no removal). Fixed by treating the tool axis as world-Z and **decoupling XY from
+  Z**: XY = signed capsule distance to the segment's XY projection; Z = the UNION
+  tip-Z extent over the t-range whose moving disk covers p.xy (whole-segment range
+  for shallow moves — cheap; exact quadratic-solved covered range for steep moves —
+  so a ramp doesn't over-remove the shaft below it); combine as a 2D box SDF in
+  (lateral, axial). Validated: plunge interior returns the correct negative depth,
+  floor is continuous. (CAMotics `ConicSweep.cpp:65` special-cases the same vertical
+  degeneracy.) Cone branch adapted best-effort (still untested).
+- **Sidewall quality:** the normal/AO/min-step scales were tied to `u_gridCell`
+  (part-size/64 ≈ 3mm on the scorpion plate, >> the ~2mm cut). Added `u_featureScale`
+  (≈ min tool radius, computed in `buildCut`) and retied normal h, AO radii, and the
+  sphere-trace min step to it; `u_gridCell` now only drives grid traversal + the
+  open-space step cap. `shade()` got an ambient floor + a camera headlight so
+  near-vertical cut walls are lit.
+- **Perf-aware rendering (`viewer.ts animate`):** render-on-demand via a `dirty`
+  flag (set by an OrbitControls `'change'` listener, applyTime/scrub, playback,
+  resize, toggles) — idle drops from 60fps to **0 renders/s**; `controls.update()`
+  still runs every frame for damping. Dynamic resolution: drop to 0.5× pixel ratio
+  while interacting (orbit/scrub/play), restore full res + one crisp render ~280ms
+  after settling. `__viewer` gained `renderNow`/`getRenderCount`/`isInteracting`.
+- Tests: `test_cut.py` adds a slant_test plunge guard (within-part luma contrast >12
+  — a solid-shaft regression is flat/low-contrast); `perf_cut.py` reports idle
+  renders/s. All green: cut 8/8, volume 8/8, vanilla e2e 11/11, smoke PASS.
+
+### Cut v3.2 — take-home: depth occlusion, code reduction, temporal pruning
+- **SDF depth occlusion:** the cut fragment shader now writes `gl_FragDepth` at the
+  ray hit (`clip = projectionMatrix*modelViewMatrix*vec4(p - u_stockCenter,1)` since
+  the raymarch is in RAW coords; `gl_FragDepth=(clip.z/clip.w)*0.5+0.5`; `discard`
+  writes none). So the toolpath lines + tool marker are correctly OCCLUDED by
+  material in front — path reads as sitting in the grooves, marker hidden where it
+  dips into stock. Line material: depthWrite:false + a tiny clip-z bias in LINE_VERT
+  so the floor path doesn't z-fight. (projectionMatrix/modelViewMatrix are declared
+  in the fragment shader — three.js only auto-injects them into the vertex stage.)
+- **Deleted the Volume (voxel field) mode** — Cut strictly supersedes it. Removed
+  volumeShader.ts, test_volume.py, buildVolume/renderVolume, bakeVolume/VolumeData,
+  __bakeVolume, the C++ Sim::bake + field members + embind, the UI option. Dropdown
+  is now Cut / Mesh. ~530 LOC gone; wasm shrank.
+- **Unified render scaffolding** into `setupScene(tp, finalTime)` (renderCut /
+  renderResult).
+- **Temporal move pruning:** bakeCut `stable_sort`s moves by tStart before grid
+  binning, so each cell's CSR list is tStart-ascending; the shader `break`s once a
+  move hasn't started. ~2x faster median while scrubbing dense paths (vcarve median
+  ~440ms->164ms under swiftshader; final frame unchanged).
+- Verified: cut 8/8 (squirm + plunge + occlusion visual), e2e_smoke PASS, vanilla
+  e2e 11/11, perf idle 0 renders.
+
+### Cut v3.3 — polish: tool marker radius + thin-wall haze
+- **Marker was wider than the cut:** `toolpathToJSON` ran BEFORE
+  `Workpiece::update()`, which is what populates the tool table — so "tools"
+  serialized empty and `buildToolMarker`/dashboard fell back to Ø3 (r=1.5) vs the
+  real r=1. Fixed by reordering update() before toolpathToJSON in both bakeCut and
+  run(); marker now matches the SDF and the dashboard shows the real diameter.
+- **Hazy z-fight on thin walls:** camera near/far was `radius/100 .. radius*100`
+  (10000:1) — terrible depth precision, which the new gl_FragDepth occlusion exposed
+  as z-fighting between the path and the groove floor. Tightened to `radius/40 ..
+  radius*16` (~600:1) and bumped the LINE_VERT bias 1e-4->4e-4 -> path reads clean.
+- **Raymarch isosurface aliasing:** MSAA doesn't touch the per-fragment raymarch, so
+  thin walls aliased on standard-DPI screens. Settled frames now supersample
+  (pixelRatio floored to 1.5) — a one-off cost under render-on-demand; interaction
+  still halves it. Cut 8/8, smoke, vanilla e2e 11/11 all green.
+
+### Cut v3.4 — tolerance erosion + sharp stock corners
+- **Near-breakthrough haze** (a cut that went almost-but-not-quite through leaves a
+  sub-pixel sliver that shimmers): render the solid ERODED by `u_tolerance` (0.0127mm
+  ~= half a thou) — sceneSDF(p)+u_tolerance — so solid features thinner than ~2x it
+  snap to a clean breakthrough. Convex stock corners stay sharp (erosion only rounds
+  concave). Paired with **linear hit-refinement** in the march (interpolate the
+  surface crossing between the last two samples): the 0.25mm min step is far coarser
+  than the tolerance shell, so without refinement we'd overshoot a thin wall — this
+  also crisps thin features generally.
+- **Filleted-looking corners (stock AND cuts):** the SDFs are geometrically sharp,
+  but a finite-difference normal smears every CSG crease into a ~2h fillet. Replaced
+  it with FULLY ANALYTIC normals (`hitNormal`): `boxNormal()` (axis-aligned stock
+  face) where the box dominates (`boxSDF > -cutDist`), else `cutNormal()` — which
+  re-scans p's grid cell for the active tool and returns its analytic wall (radial,
+  cone-slanted) or floor (vertical) normal via `toolNormal()`. Crisp edges on the
+  stock AND the cut result geometry (floor<->wall creases, cut rims, scallops), and
+  it's slightly FASTER than the old 4-tap finite diff (1 cell scan vs 4). u_tolerance
+  is a uniform (tunable). All suites green; perf scorpion 18ms / heart 42ms settled.
+
+### Cut v3.5 — marker fixes, breakthrough haze, AA
+- **Marker wider than the cut (heart):** the heart opens with a tool-less rapid
+  (tool = -1), so `moves[0].tool` had no table entry and the marker fell back to Ø3
+  (r=1.5) vs the real r=1. Now `buildToolMarker` uses the first move that actually
+  has a tool for the cylinder SIZE; and during no-tool moments (active move's tool
+  not in the table) the marker GHOSTS (transparent, depthWrite off) instead of
+  showing a solid mismatched cylinder.
+- **"Grazed the bottom exactly" haze (owner diagnosed it):** a near-zero-thickness
+  floor on an almost-through cut got stepped OVER by some rays (min step 0.25mm >>
+  the sliver) and sampled by others -> salt-and-pepper of floor vs background
+  through the holes. Fix: near the stock bottom (within ~0.6*featureScale, the
+  breakthrough zone) step at the erosion scale (u_tolerance*2) so the floor/hole
+  boundary resolves as one clean contour; dense relief away from the bottom keeps
+  coarse steps (vcarve unaffected). Also biased `hitNormal` toward the cut floor
+  (`boxSDF > -cutDist + featureScale*0.03`) so a thin floor doesn't flicker between
+  the opposite box-bottom and cut-floor normals.
+- **AA:** settled supersample bumped 1.5x -> 2x (still render-on-demand one-off;
+  interaction halves it). All suites green; perf settled scorpion 32 / heart 64 /
+  vcarve 536ms (swiftshader floor; ~1/15 that on a real GPU).
+
 ## Remaining (future)
+- Dense-path perf (vcarve ~199 moves/cell): inherent overlap, not grid resolution.
+  The correct SDF is heavier per move, so swiftshader vcarve is ~400ms (one full-res
+  settle frame; ~30ms on real GPU, and interaction runs at 0.5× res). Options:
+  temporal pruning (sort cell moves by tStart, binary-search to scrub), or
+  auto-fallback to Volume mode above a density threshold. Deferred by owner.
+- Conical/ballnose swept-SDF paths are implemented but untested (all bundled
+  examples use a cylindrical Ø2 tool); verify against a V-bit program.
+- Validation cross-check: the analytic Cut is OUR geometry; an automated diff vs the
+  true CAMotics mesh (Mesh mode) would keep them honest for the "validate other
+  sims" use-case.
 - Surface mesh in-browser: computeSurface uses threaded marching cubes
   (Renderer spawns cb::Thread RenderJobs). Needs em++ -pthread (workers +
   SharedArrayBuffer + COOP/COEP serving headers), or make Renderer run inline

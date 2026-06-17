@@ -1,0 +1,25 @@
+{
+  "name": "camotics-app",
+  "version": "0.1.0",
+  "description": "CAMotics wasm viewer — Parcel 2 + Preact + TypeScript",
+  "private": true,
+  "scripts": {
+    "dev": "parcel src/index.html --host 0.0.0.0 --port 1234",
+    "build": "parcel build src/index.html --public-url ./ --dist-dir dist",
+    "serve": "parcel src/index.html --port 1234"
+  },
+  "dependencies": {
+    "preact": "^10.22.0",
+    "three": "0.160.x"
+  },
+  "@parcel/resolver-default": {
+    "packageExports": true
+  },
+  "devDependencies": {
+    "@parcel/transformer-glsl": "^2.12.0",
+    "@types/three": "0.160.x",
+    "parcel": "^2.12.0",
+    "process": "^0.11.10",
+    "typescript": "^5.4.0"
+  }
+}
