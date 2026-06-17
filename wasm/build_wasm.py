@@ -9,6 +9,7 @@ One-stop build for the in-browser CAMotics core (wasm) + parcel app.
     uv run wasm/build_wasm.py --clean        # wipe build objects + outputs, rebuild
     uv run wasm/build_wasm.py --clean-all    # also re-fetch pinned deps (~1.5G)
     uv run wasm/build_wasm.py --fetch-only   # provision deps/toolchain only, no build
+    uv run wasm/build_wasm.py --build-app    # release (-O3+LTO) wasm + parcel app -> dist, no serve
     uv run wasm/build_wasm.py --serve        # build the app too + serve dist on :8000
     uv run wasm/build_wasm.py --serve --port 8101
 
@@ -142,11 +143,16 @@ def provision(deep_clean=False):
 # ---------------------------------------------------------------------------
 # Compile + link (emscripten). Mirrors the old build_wasm.sh exactly.
 # ---------------------------------------------------------------------------
+# RELEASE is flipped on by --build-app; it selects -O3+LTO (vs -O2), drops
+# -sASSERTIONS, and uses a separate object dir so debug/release .o files (the
+# staleness check is mtime-only, not flag-aware) never get cross-reused.
+RELEASE = False
 OBJ = WASM / "wobj"
 EXPAT = WASM / "libexpat" / "expat" / "lib"
 INC = ["-Iwasm/cbang/src", "-Iwasm/cbang/include", "-Iwasm/cbang/src/boost",
        f"-I{EXPAT}", "-Isrc", "-Ibuild"]
-DEF = ["-std=c++17", "-O2", "-fexceptions",
+# Optimization flags (-O2/-O3 +LTO) are prepended per-call in build_wasm().
+DEF = ["-std=c++17", "-fexceptions",
        "-DHAVE_CBANG", "-DUSING_CBANG", "-DCAMOTICS_NO_TPL"]
 PTHREAD = os.environ.get("PTHREAD", "").split()  # empty (v1 is single-threaded)
 LOG = WASM / "build_wasm.log"
@@ -211,6 +217,11 @@ def emsdk_env():
 
 
 def build_wasm():
+    global OBJ
+    OBJ = WASM / ("wobj-release" if RELEASE else "wobj")
+    optflags = ["-O3", "-flto"] if RELEASE else ["-O2"]  # -flto on compile AND link
+    assertions = "-sASSERTIONS=0" if RELEASE else "-sASSERTIONS=1"
+    log(f"build mode: {'RELEASE (-O3 +LTO, no assertions)' if RELEASE else 'debug (-O2)'}")
     OBJ.mkdir(parents=True, exist_ok=True)
     os.environ.update(emsdk_env())  # put em++/emcc/emar on PATH for all subprocesses
     LOG.write_text("")
@@ -223,7 +234,7 @@ def build_wasm():
         for f in _globs(ROOT, CORE_GLOBS):
             if f.name == "TPLRunner.cpp":   # TPL-only, excluded
                 continue
-            core_objs.append(compile_one("core", f, ROOT, DEF + PTHREAD + INC, log_fh=fh))
+            core_objs.append(compile_one("core", f, ROOT, optflags + DEF + PTHREAD + INC, log_fh=fh))
         print(f"  core: {len(core_objs)} files", flush=True)
 
         print("=== cbang subset ===", flush=True)
@@ -232,10 +243,10 @@ def build_wasm():
         for f in _globs(cbang, CBANG_GLOBS):
             if f.name == "Random.cpp":      # needs openssl
                 continue
-            cbang_objs.append(compile_one("cbang", f, cbang, DEF + PTHREAD + cbinc, log_fh=fh))
+            cbang_objs.append(compile_one("cbang", f, cbang, optflags + DEF + PTHREAD + cbinc, log_fh=fh))
 
         print("=== re2 (bundled in cbang; NO_THREADS) ===", flush=True)
-        re2_flags = ["-std=c++17", "-O2", "-fexceptions", "-DNO_THREADS",
+        re2_flags = ["-std=c++17", *optflags, "-fexceptions", "-DNO_THREADS",
                      *PTHREAD, "-Isrc/re2/src", "-Iinclude"]
         re2_objs = []
         for f in _globs(cbang, ["src/re2/src/re2/*.cc", "src/re2/src/util/*.cc"]):
@@ -249,7 +260,7 @@ def build_wasm():
                 continue
             boost_objs.append(compile_one(
                 "boost", f, cbang,
-                DEF + PTHREAD + ["-Isrc", "-Isrc/boost", "-fexceptions", "-sUSE_ZLIB=1"],
+                optflags + DEF + PTHREAD + ["-Isrc", "-Isrc/boost", "-fexceptions", "-sUSE_ZLIB=1"],
                 log_fh=fh))
 
         print("=== expat (xmlparse/xmlrole/xmltok) ===", flush=True)
@@ -259,7 +270,7 @@ def build_wasm():
             obj = OBJ / f"expat__{name}.o"
             if not (obj.exists() and obj.stat().st_mtime >= src.stat().st_mtime):
                 rc = subprocess.run(
-                    ["emcc", "-O2", *PTHREAD, "-DXML_GE=1", "-DXML_POOR_ENTROPY",
+                    ["emcc", *optflags, *PTHREAD, "-DXML_GE=1", "-DXML_POOR_ENTROPY",
                      "-DXML_STATIC", f"-I{EXPAT}", "-c", str(src), "-o", str(obj)],
                     stderr=fh).returncode
                 if rc != 0:
@@ -268,8 +279,8 @@ def build_wasm():
             expat_objs.append(obj)
 
         print("=== embind glue + comp stub ===", flush=True)
-        glue_o = compile_one("glue", WASM / "glue.cpp", ROOT, DEF + PTHREAD + INC, log_fh=fh)
-        comp_o = compile_one("glue", WASM / "comp_stub.cpp", ROOT, DEF + PTHREAD + INC, log_fh=fh)
+        glue_o = compile_one("glue", WASM / "glue.cpp", ROOT, optflags + DEF + PTHREAD + INC, log_fh=fh)
+        comp_o = compile_one("glue", WASM / "comp_stub.cpp", ROOT, optflags + DEF + PTHREAD + INC, log_fh=fh)
 
         print("=== archive ===", flush=True)
         ar = OBJ / "libcamcore.a"
@@ -283,9 +294,9 @@ def build_wasm():
         out_js = WASM / "app" / "src" / "wasm" / "camotics.js"
         out_js.parent.mkdir(parents=True, exist_ok=True)
         link = subprocess.run(
-            ["em++", "-O2", "-fexceptions", *PTHREAD, "--bind",
+            ["em++", *optflags, "-fexceptions", *PTHREAD, "--bind",
              "-sMODULARIZE=1", "-sEXPORT_NAME=createCAMotics", "-sEXPORT_ES6=1",
-             "-sALLOW_MEMORY_GROWTH=1", "-sENVIRONMENT=web", "-sASSERTIONS=1",
+             "-sALLOW_MEMORY_GROWTH=1", "-sENVIRONMENT=web", assertions,
              "-sEXPORTED_RUNTIME_METHODS=FS",
              "-sERROR_ON_UNDEFINED_SYMBOLS=0", "-sUSE_ZLIB=1",
              str(glue_o), str(comp_o), str(ar), "-o", str(out_js)],
@@ -312,9 +323,13 @@ def build_wasm():
 # clean + serve
 # ---------------------------------------------------------------------------
 def clean(deep=False):
-    targets = [OBJ,
+    # Wipe everything the build produces: object dirs, the linked wasm core, and
+    # the built static site. Leaves provisioned deps (emsdk/cbang/libexpat) unless
+    # deep. node_modules is left alone — `npm ci` rewrites it deterministically.
+    targets = [WASM / "wobj", WASM / "wobj-release",
                WASM / "app" / "src" / "wasm" / "camotics.js",
-               WASM / "app" / "src" / "wasm" / "camotics.wasm"]
+               WASM / "app" / "src" / "wasm" / "camotics.wasm",
+               WASM / "app" / "dist"]
     if deep:
         targets += [WASM / "cbang", WASM / "emsdk", WASM / "libexpat"]
     for t in targets:
@@ -324,10 +339,20 @@ def clean(deep=False):
             t.unlink(); log(f"removed {t.relative_to(WASM)}")
 
 
+def build_app():
+    # Build the static site into wasm/app/dist. `parcel build` is a minified
+    # production bundle. check=True so CI fails loudly on any npm error.
+    app = WASM / "app"
+    log("npm ci")
+    subprocess.run(["npm", "ci"], cwd=app, check=True)
+    log("building parcel app (npm run build)")
+    subprocess.run(["npm", "run", "build"], cwd=app, check=True)
+    log(f"built {(app / 'dist').relative_to(WASM)}/")
+
+
 def serve(port):
     app = WASM / "app"
-    log("building parcel app (npm run build)")
-    subprocess.run(["npm", "run", "build"], cwd=app, check=False)
+    build_app()
     log(f"serving wasm/app/dist on 0.0.0.0:{port} (Ctrl-C to stop)")
     subprocess.run([sys.executable, str(app / "serve_dist.py"), str(port)], cwd=app)
 
@@ -340,6 +365,9 @@ def main():
                     help="--clean plus re-fetch deps (re-downloads ~1.5G)")
     ap.add_argument("--fetch-only", action="store_true",
                     help="provision deps/toolchain only; skip the wasm build")
+    ap.add_argument("--build-app", action="store_true",
+                    help="release build (-O3+LTO) of the wasm core AND the parcel app "
+                         "into wasm/app/dist; no serving (for CI / deploy)")
     ap.add_argument("--serve", action="store_true", help="build the app + serve dist after building")
     ap.add_argument("--port", type=int, default=8000, help="serve port (default 8000)")
     args = ap.parse_args()
@@ -351,6 +379,14 @@ def main():
 
     if args.fetch_only:
         log("deps ready (--fetch-only). Build with:  uv run wasm/build_wasm.py")
+        return
+
+    if args.build_app:
+        global RELEASE
+        RELEASE = True
+        build_wasm()
+        build_app()
+        log("done. Static site is in wasm/app/dist/")
         return
 
     build_wasm()

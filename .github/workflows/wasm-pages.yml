@@ -1,0 +1,73 @@
+name: Deploy WASM Page
+
+on:
+  push:
+    branches: [wasm]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy at a time; cancel in-progress runs on new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build wasm page
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install apt build deps   # needed for cbang's native scons build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkgconf \
+            libboost-dev libboost-iostreams-dev libssl-dev libexpat1-dev \
+            zlib1g-dev libbz2-dev liblz4-dev libsqlite3-dev libevent-dev \
+            libyaml-dev libre2-dev libleveldb-dev libsnappy-dev
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install scons
+        run: |
+          uv tool install scons
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"   # build script uses shutil.which("scons")
+
+      - name: Cache wasm toolchain + deps   # emsdk ~1.5G, native-built cbang, libexpat
+        uses: actions/cache@v4
+        with:
+          path: |
+            wasm/emsdk
+            wasm/cbang
+            wasm/libexpat
+          # build_wasm.py holds the pinned dep SHAs + EMSDK_VERSION, so its hash
+          # is the cache key: bump a pin -> new key -> deps re-provisioned.
+          key: wasm-toolchain-${{ hashFiles('wasm/build_wasm.py') }}
+
+      - name: Build wasm core + app (release)
+        run: uv run wasm/build_wasm.py --build-app
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: wasm/app/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
