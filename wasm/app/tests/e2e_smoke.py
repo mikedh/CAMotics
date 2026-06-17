@@ -18,7 +18,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent  # app/ (this file is app/tests/)
 DIST_DIR = (APP_DIR / "dist").resolve()
 SCREENSHOT = APP_DIR / "smoke.png"
 CHROMIUM = "/snap/bin/chromium"

@@ -19,7 +19,7 @@ from PIL import Image, ImageChops
 from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).resolve().parent
-DIST = HERE / "dist"
+DIST = HERE.parent / "dist"   # app/dist (tests/ live one level under the app)
 EXAMPLE = "heart.ngc"
 CHROMIUM = "/snap/bin/chromium"
 DIFF_LUMA = 24

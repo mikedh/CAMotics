@@ -66,17 +66,19 @@ uniform vec3  u_baseColor;
 uniform vec3  u_lightDir;
 uniform float u_tolerance;     // erode the solid by this (mm): solid features thinner
                                // than ~2x it snap away (clean near-breakthroughs)
+uniform float u_pixelWorld;    // world units / pixel / unit ray-distance = 2*tan(fovY/2)/Hpx
+uniform vec3  u_clearColor;    // background color, for analytic silhouette coverage AA
 
 // three.js injects these into the vertex stage only; declare them here so the
 // fragment shader can map the SDF hit point to depth (uniforms are program-wide).
 uniform mat4  projectionMatrix;
 uniform mat4  modelViewMatrix;
 
-const int   HARD_STEPS = 768;
-const int   MAX_PER_CELL = 4096;
-const float SURF = 0.0;
+const int HARD_STEPS = 768;      // GLSL needs a constant loop bound; u_maxSteps caps it
+const int MAX_PER_CELL = 4096;   // safety bound on moves scanned per grid cell
 
-vec4 fetch(sampler2D t, int i, int w) { return texelFetch(t, ivec2(i % w, i / w), 0); }
+// Fetch texel i from a 1D-indexed 2D data texture of width w (CSR / move streams).
+vec4 fetch(sampler2D tex, int i, int w) { return texelFetch(tex, ivec2(i % w, i / w), 0); }
 
 // Signed distance to one vertical tool (axis = world +Z) swept linearly along
 // segment a->b. shape: 0 cylindrical, 1 conical, 2 ballnose, 3 spheroid, 4 snub.
@@ -102,10 +104,10 @@ float toolDist(vec3 p, vec3 a, vec3 b, vec4 tool) {
   }
 
   // --- XY: signed capsule distance to the segment's XY projection ---
-  vec2 d = ba.xy, e = a.xy - p.xy;
-  float dd = dot(d, d);
-  float txy = dd > 1e-12 ? clamp(-dot(e, d) / dd, 0.0, 1.0) : 0.0;
-  float distXY = length(p.xy - (a.xy + txy * d));
+  vec2  segXY = ba.xy, relXY = a.xy - p.xy;      // XY segment direction; a->p offset
+  float seg2  = dot(segXY, segXY);               // |segXY|^2
+  float txy   = seg2 > 1e-12 ? clamp(-dot(relXY, segXY) / seg2, 0.0, 1.0) : 0.0;
+  float distXY = length(p.xy - (a.xy + txy * segXY));
   float dxy = distXY - r;
 
   // --- Z: union tip-Z extent of the tool over this move at p's XY ---
@@ -117,22 +119,23 @@ float toolDist(vec3 p, vec3 a, vec3 b, vec4 tool) {
     zTop   = max(a.z, b.z) + len;
   } else {
     // steep/plunge: use only the t-range whose moving disk actually covers p.xy
-    // (solving dd t^2 + 2(e.d)t + (e.e-r^2)=0) so the swept Z-extent is correct and
-    // we don't over-remove the shaft below a ramp. C.z is linear in t.
+    // (solving seg2 t^2 + 2(relXY.segXY)t + (|relXY|^2 - r^2) = 0) so the swept
+    // Z-extent is correct and we don't over-remove the shaft below a ramp.
     float txa, txb;
-    if (dd > 1e-12) {
-      float ed = dot(e, d), disc = ed * ed - dd * (dot(e, e) - r * r);
+    if (seg2 > 1e-12) {
+      float relDot = dot(relXY, segXY);
+      float disc   = relDot * relDot - seg2 * (dot(relXY, relXY) - r * r);
       if (disc > 0.0) {
-        float s = sqrt(disc);
-        txa = clamp((-ed - s) / dd, 0.0, 1.0);
-        txb = clamp((-ed + s) / dd, 0.0, 1.0);
+        float root = sqrt(disc);
+        txa = clamp((-relDot - root) / seg2, 0.0, 1.0);
+        txb = clamp((-relDot + root) / seg2, 0.0, 1.0);
       } else { txa = txy; txb = txy; }          // never covered -> single point
     } else {                                     // pure plunge (no XY motion)
-      bool cov = dot(e, e) <= r * r;
-      txa = cov ? 0.0 : txy;
-      txb = cov ? 1.0 : txy;
+      bool covered = dot(relXY, relXY) <= r * r;
+      txa = covered ? 0.0 : txy;
+      txb = covered ? 1.0 : txy;
     }
-    float za = a.z + txa * ba.z, zb = a.z + txb * ba.z;
+    float za = a.z + txa * ba.z, zb = a.z + txb * ba.z;  // tip Z at the covered ends
     zTipLo = min(za, zb);
     zTop   = max(za, zb) + len;
   }
@@ -165,10 +168,10 @@ vec3 toolNormal(vec3 p, vec3 a, vec3 b, vec4 tool) {
     vec3 c = a + tt * ba; c.z += r;
     return normalize(p - c);
   }
-  vec2 d = ba.xy, e = a.xy - p.xy;
-  float dd = dot(d, d);
-  float txy = dd > 1e-12 ? clamp(-dot(e, d) / dd, 0.0, 1.0) : 0.0;
-  vec2 radial = p.xy - (a.xy + txy * d);
+  vec2  segXY = ba.xy, relXY = a.xy - p.xy;
+  float seg2  = dot(segXY, segXY);
+  float txy   = seg2 > 1e-12 ? clamp(-dot(relXY, segXY) / seg2, 0.0, 1.0) : 0.0;
+  vec2  radial = p.xy - (a.xy + txy * segXY);
   float distXY = length(radial);
   float zTipLo = min(a.z, b.z), zTop = max(a.z, b.z) + len;
   float rb = (shape == 1) ? 0.0 : (shape == 4 ? snub : r);
@@ -182,66 +185,72 @@ vec3 toolNormal(vec3 p, vec3 a, vec3 b, vec4 tool) {
   return vec3(0.0, 0.0, 1.0);                       // on the floor/cap
 }
 
-// Distance to the union of time-gated swept tools near p (negative inside the
-// removed region). Only the moves binned into p's grid cell are tested.
-float cutDist(vec3 p) {
+// CSR [start, end) range of move indices binned into p's grid cell.
+ivec2 cellMoveRange(vec3 p) {
   ivec3 c = clamp(ivec3(floor((p - u_gridOrigin) / u_gridCell)), ivec3(0), u_gridDims - 1);
-  int lin   = (c.z * u_gridDims.y + c.y) * u_gridDims.x + c.x;
-  int start = int(fetch(u_cellStart, lin,     u_startTexW).x + 0.5);
-  int end   = int(fetch(u_cellStart, lin + 1, u_startTexW).x + 0.5);
+  int lin = (c.z * u_gridDims.y + c.y) * u_gridDims.x + c.x;
+  return ivec2(int(fetch(u_cellStart, lin,     u_startTexW).x + 0.5),
+               int(fetch(u_cellStart, lin + 1, u_startTexW).x + 0.5));
+}
 
+// One move resolved at the current scrub time: segment endpoints (the end clipped
+// to where the tool has actually reached if the move is still in progress), its
+// tool params, and whether it has started yet.
+struct SweptMove { vec3 a; vec3 b; vec4 tool; bool started; };
+
+SweptMove loadMove(int csrIndex) {
+  int base = int(fetch(u_cellMoves, csrIndex, u_cmTexW).x + 0.5) * 3;
+  vec4 t0 = fetch(u_moves, base,     u_moveTexW);   // x0,y0,z0,tStart
+  vec4 t1 = fetch(u_moves, base + 1, u_moveTexW);   // x1,y1,z1, ±tEnd
+  // tEnd is always >= 0, so its sign is a free per-move flag: >= 0 means this move
+  // uses the DEFAULT tool (dense index 0), so we skip the 3rd-texel tool-index fetch
+  // (the biggest per-move cost). Non-default moves stored -(tEnd+1) -> fetch the index.
+  bool defaultTool = t1.w >= 0.0;
+  float tEnd = defaultTool ? t1.w : (-t1.w - 1.0);
+  SweptMove m;
+  m.started = t0.w <= u_scrubAbs;
+  m.a = t0.xyz;
+  m.b = t1.xyz;
+  if (tEnd > u_scrubAbs)                              // in progress -> clip end to the tool
+    m.b = mix(m.a, m.b, clamp((u_scrubAbs - t0.w) / max(tEnd - t0.w, 1e-6), 0.0, 1.0));
+  m.tool = defaultTool ? u_tools[0]
+                       : u_tools[int(fetch(u_moves, base + 2, u_moveTexW).x + 0.5)];
+  return m;
+}
+
+// Distance to the union of time-gated swept tools near p (negative inside the
+// removed region). Only the moves in p's grid cell are tested; the cell list is
+// sorted by start time, so we stop at the first move not yet started.
+float cutDist(vec3 p) {
+  ivec2 range = cellMoveRange(p);
   float d = 1e9;
   for (int k = 0; k < MAX_PER_CELL; k++) {
-    int j = start + k;
-    if (j >= end) break;
-    int mi = int(fetch(u_cellMoves, j, u_cmTexW).x + 0.5);
-    int base = mi * 3;
-    vec4 m0 = fetch(u_moves, base,     u_moveTexW);   // x0,y0,z0,tStart
-    vec4 m1 = fetch(u_moves, base + 1, u_moveTexW);   // x1,y1,z1,tEnd
-    float tStart = m0.w, tEnd = m1.w;
-    // cell moves are sorted by tStart -> once one hasn't started, none after it
-    // have either, so stop scanning this cell (temporal pruning while scrubbing).
-    if (tStart > u_scrubAbs) break;
-    vec3 a = m0.xyz, b = m1.xyz;
-    if (tEnd > u_scrubAbs) {                          // in progress -> clip to tool
-      float f = clamp((u_scrubAbs - tStart) / max(tEnd - tStart, 1e-6), 0.0, 1.0);
-      b = a + (b - a) * f;
-    }
-    int ti = int(fetch(u_moves, base + 2, u_moveTexW).x + 0.5);
-    d = min(d, toolDist(p, a, b, u_tools[ti]));
+    int j = range.x + k;
+    if (j >= range.y) break;
+    SweptMove m = loadMove(j);
+    if (!m.started) break;                           // temporal pruning while scrubbing
+    d = min(d, toolDist(p, m.a, m.b, m.tool));
   }
   return d;
 }
 
-// Analytic normal of the nearest cut surface at p: re-scan p's cell for the
-// closest swept tool and return ITS analytic wall/floor normal. Only run at the
-// hit (once/pixel), so the extra cell scan is cheap.
-vec3 cutNormal(vec3 p) {
-  ivec3 c = clamp(ivec3(floor((p - u_gridOrigin) / u_gridCell)), ivec3(0), u_gridDims - 1);
-  int lin   = (c.z * u_gridDims.y + c.y) * u_gridDims.x + c.x;
-  int start = int(fetch(u_cellStart, lin,     u_startTexW).x + 0.5);
-  int end   = int(fetch(u_cellStart, lin + 1, u_startTexW).x + 0.5);
+// Nearest cut surface at p: re-scan p's cell for the closest swept tool and return
+// ITS analytic wall/floor normal in .xyz AND the min cut distance in .w. Returning
+// the distance lets hitNormal reuse it for the box-vs-cut decision instead of a
+// separate cutDist() scan. Only run at the hit (once/pixel).
+vec4 cutNormal(vec3 p) {
+  ivec2 range = cellMoveRange(p);
   float best = 1e9;
   vec3 n = vec3(0.0, 0.0, 1.0);
   for (int k = 0; k < MAX_PER_CELL; k++) {
-    int j = start + k;
-    if (j >= end) break;
-    int mi = int(fetch(u_cellMoves, j, u_cmTexW).x + 0.5);
-    int base = mi * 3;
-    vec4 m0 = fetch(u_moves, base,     u_moveTexW);
-    vec4 m1 = fetch(u_moves, base + 1, u_moveTexW);
-    float tStart = m0.w, tEnd = m1.w;
-    if (tStart > u_scrubAbs) break;
-    vec3 a = m0.xyz, b = m1.xyz;
-    if (tEnd > u_scrubAbs) {
-      float f = clamp((u_scrubAbs - tStart) / max(tEnd - tStart, 1e-6), 0.0, 1.0);
-      b = a + (b - a) * f;
-    }
-    vec4 tool = u_tools[int(fetch(u_moves, base + 2, u_moveTexW).x + 0.5)];
-    float td = toolDist(p, a, b, tool);
-    if (td < best) { best = td; n = toolNormal(p, a, b, tool); }
+    int j = range.x + k;
+    if (j >= range.y) break;
+    SweptMove m = loadMove(j);
+    if (!m.started) break;
+    float td = toolDist(p, m.a, m.b, m.tool);
+    if (td < best) { best = td; n = toolNormal(p, m.a, m.b, m.tool); }
   }
-  return n;
+  return vec4(n, best);
 }
 
 float boxSDF(vec3 p) {
@@ -270,7 +279,8 @@ vec3 boxNormal(vec3 p) {
 // vs floor-up), so an unbiased pick flickers per-pixel -> haze. Bias toward the
 // cut floor (what you actually see from above) so it renders consistently.
 vec3 hitNormal(vec3 p) {
-  return (boxSDF(p) > -cutDist(p) + u_featureScale * 0.03) ? boxNormal(p) : cutNormal(p);
+  vec4 cn = cutNormal(p);   // .xyz = cut normal, .w = nearest cut distance (reused below)
+  return (boxSDF(p) > -cn.w + u_featureScale * 0.03) ? boxNormal(p) : cn.xyz;
 }
 
 vec2 hitBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi) {
@@ -335,11 +345,13 @@ void main() {
   // tolerance shell, so we'd otherwise overshoot a thin wall).
   float maxStep = u_gridCell * 6.0;
   float t = tn + 1e-4;
-  float dPrev = 1e9, tPrev = t;
+  float dPrev = 1e9, tPrev = t, dPrev2 = 1e9, tPrev2 = t;
+  float minD = 1e9, tClose = t;          // closest approach -> analytic edge coverage
   for (int i = 0; i < HARD_STEPS; i++) {
     if (i >= u_maxSteps || t > tf) break;
     vec3 p = ro + rd * t;
     float d = sceneSDF(p) + u_tolerance;
+    if (d < minD) { minD = d; tClose = t; }
     if (d < 1e-4) {
       float th = (dPrev < 1e9) ? mix(tPrev, t, clamp(dPrev / max(dPrev - d, 1e-6), 0.0, 1.0)) : t;
       p = ro + rd * th;
@@ -353,7 +365,22 @@ void main() {
       gl_FragDepth = (clip.z / clip.w) * 0.5 + 0.5;
       return;
     }
-    dPrev = d; tPrev = t;
+    // Parabolic refine of the closest approach: at a local min (dPrev below both
+    // neighbours) the TRUE closest distance is the parabola vertex, not the coarse
+    // sample -> smooth coverage instead of sampled-min jitter (the residual
+    // shallow-angle serration). Newton form; vertex clamped to the bracket so
+    // unequal step spacing can't overshoot.
+    if (dPrev < d && dPrev < dPrev2 && dPrev2 < 1e8) {
+      float slopeL = (dPrev - dPrev2) / max(tPrev - tPrev2, 1e-9);   // d slope, left pair
+      float slopeR = (d - dPrev) / max(t - tPrev, 1e-9);             // d slope, right pair
+      float curv   = (slopeR - slopeL) / max(t - tPrev2, 1e-9);      // 2nd difference
+      if (curv > 1e-9) {                                             // convex -> real min
+        float tVtx = clamp((tPrev2 + tPrev) * 0.5 - slopeL / (2.0 * curv), tPrev2, t);
+        float dVtx = dPrev2 + slopeL * (tVtx - tPrev2) + curv * (tVtx - tPrev2) * (tVtx - tPrev);
+        if (dVtx < minD) { minD = max(dVtx, 0.0); tClose = tVtx; }
+      }
+    }
+    dPrev2 = dPrev; tPrev2 = tPrev; dPrev = d; tPrev = t;
     // Near the stock BOTTOM (the breakthrough zone) step at the erosion scale so a
     // near-zero-thickness floor isn't stepped over by some rays and sampled by
     // others (the salt-and-pepper "haze" through almost-through cuts). Everywhere
@@ -361,6 +388,23 @@ void main() {
     float minStep = (p.z < u_stockMin.z + u_featureScale * 0.6)
       ? u_tolerance * 2.0 : u_featureScale * 0.25;
     t += clamp(d * 0.9, minStep, maxStep);
+  }
+
+  // MISS. Analytic silhouette anti-aliasing: if the ray grazed a surface within ~one
+  // pixel (minD < the pixel's world width at that depth), this is a silhouette EDGE.
+  // Shade the closest-approach point and feather it over the known background by a
+  // distance-derived coverage -> a clean ~1px ramp instead of a jagged hard miss.
+  // One code path crisps EVERY silhouette: stock edges, cut rims, knife-edge ridges.
+  float pxSpan = tClose * u_pixelWorld;
+  if (minD < pxSpan) {
+    vec3 pc = ro + rd * tClose;
+    vec3 shaded = shade(hitNormal(pc), rd, 1.0);   // fixed AO: blended into bg anyway
+    float coverage = 1.0 - smoothstep(0.0, pxSpan, minD);
+    fragColor = vec4(mix(u_clearColor, shaded, coverage), 1.0);
+    // keep the box-backface depth (NOT the surface) so the toolpath/marker still show
+    // through the mostly-transparent silhouette band instead of being hard-occluded
+    gl_FragDepth = gl_FragCoord.z;
+    return;
   }
   discard;
 }

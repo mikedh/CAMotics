@@ -102,7 +102,13 @@ export class Viewer {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,                  // AAs the lines + box edges in the 1x interaction
+                                        // frame (the 2x settled frame supersamples anyway)
+      powerPreference: 'high-performance', // ask for the discrete GPU on dual-GPU laptops
+      stencil: false,                   // we never use stencil — skip the buffer
+    });
     // Settled frames supersample at 2x: MSAA doesn't antialias the per-fragment
     // raymarch isosurface, so the crisp analytic edges alias without it. Render-on-
     // demand makes this a one-off cost; interaction still drops to half this.
@@ -152,6 +158,7 @@ export class Viewer {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    this.updatePixelWorld();
     this.markDirty();
   }
 
@@ -349,8 +356,13 @@ export class Viewer {
       packed[d + 4] = m[s + 3];
       packed[d + 5] = m[s + 4];
       packed[d + 6] = m[s + 5];
-      packed[d + 7] = m[s + 7]; // tEnd
-      packed[d + 8] = m[s + 8]; // toolIdx
+      // tEnd carries a free per-move flag in its sign: a move on the default tool
+      // (dense index 0) stores +tEnd so the shader can skip the tool-index fetch;
+      // others store -(tEnd+1) (the +1 keeps it strictly <= -1 even when tEnd==0).
+      const tEnd = m[s + 7],
+        toolIdx = m[s + 8];
+      packed[d + 7] = toolIdx === 0 ? tEnd : -(tEnd + 1.0);
+      packed[d + 8] = toolIdx; // read only for non-default moves
     }
     const moveTex = this.floatTex(packed, 4, MW);
     const startTex = this.floatTex(Float32Array.from(cut.cellStart), 1, CW);
@@ -411,6 +423,8 @@ export class Viewer {
         u_maxSteps: { value: Math.min(768, Math.ceil((diag / cut.gridCell) * 4) + 128) },
         u_baseColor: { value: new THREE.Color(0x9aa0a6) },
         u_lightDir: { value: new THREE.Vector3(0.4, 0.6, 0.9).normalize() },
+        u_pixelWorld: { value: 0 }, // set by updatePixelWorld() below (px footprint)
+        u_clearColor: { value: CLEAR_COLOR.clone() },
       },
       vertexShader: cutVertexShader,
       fragmentShader: cutFragmentShader,
@@ -422,6 +436,20 @@ export class Viewer {
     this.cutMesh = mesh;
     this.cutMat = mat;
     this.world.add(mesh);
+    this.updatePixelWorld();
+  }
+
+  // World units per pixel per unit ray-distance: 2*tan(fovY/2) / renderedHeightPx.
+  // Feeds the shader's analytic edge AA so the silhouette coverage band is ~1px wide.
+  // Reads getPixelRatio() live, so it auto-widens at low res during interaction.
+  private updatePixelWorld() {
+    if (!this.cutMat) return;
+    const h =
+      (this.canvas.clientHeight || this.canvas.parentElement?.clientHeight || 0) *
+      this.renderer.getPixelRatio();
+    if (h <= 0) return;
+    const fovRad = (this.camera.fov * Math.PI) / 180;
+    this.cutMat.uniforms.u_pixelWorld.value = (2 * Math.tan(fovRad / 2)) / h;
   }
 
   // Shared render scaffolding: recenter the world, add toolpath + marker, fit the
@@ -566,6 +594,7 @@ export class Viewer {
     const w = this.canvas.clientWidth || this.canvas.parentElement?.clientWidth || 0;
     const h = this.canvas.clientHeight || this.canvas.parentElement?.clientHeight || 0;
     if (w && h) this.renderer.setSize(w, h, false);
+    this.updatePixelWorld(); // AA band auto-widens at the lower interaction res
   }
 
   private animate(now: number) {

@@ -5,7 +5,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).resolve().parent
-DIST = HERE / "dist"
+DIST = HERE.parent / "dist"   # app/dist (tests/ live one level under the app)
 CHROMIUM = "/snap/bin/chromium"
 EXAMPLES = sys.argv[1:] or ["scorpion.nc", "heart.ngc", "compass_text.ngc", "vcarve.ngc"]
 

@@ -215,7 +215,9 @@ public:
     }
     nToolsV = (int)toolIdx.size();
 
-    // Moves (+ per-move swept bbox for grid binning).
+    // One move for export: `d` packs the 9 floats per move uploaded to the GPU move
+    // texture — x0,y0,z0, x1,y1,z1, tStart, tEnd, toolIdx (so d[6] is tStart). bmin/
+    // bmax is its swept-tool bounding box, used to bin it into the uniform grid.
     struct MV { float d[9]; double bmin[3], bmax[3]; };
     std::vector<MV> ms;
     for (unsigned i = 0; i < path->size(); i++) {
@@ -250,7 +252,7 @@ public:
     // (temporal pruning while scrubbing). The SDF is a min over moves, so order
     // is otherwise irrelevant; the dashboard/path use the separate toolpath order.
     std::stable_sort(ms.begin(), ms.end(),
-                     [](const MV &a, const MV &b){ return a.d[6] < b.d[6]; });
+                     [](const MV &a, const MV &b){ return a.d[6] < b.d[6]; }); // by tStart
     movesData.reserve((size_t)nMovesV * 9);
     for (auto &m : ms) for (int k = 0; k < 9; k++) movesData.push_back(m.d[k]);
 
@@ -267,23 +269,26 @@ public:
     gCell = cell; gOrigin[0] = ox; gOrigin[1] = oy; gOrigin[2] = oz;
     size_t nCells = (size_t)gnx * gny * gnz;
 
-    auto cl = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
-    auto range = [&](const MV &m, int *r) {
-      r[0]=cl((int)std::floor((m.bmin[0]-ox)/cell),gnx-1); r[1]=cl((int)std::floor((m.bmax[0]-ox)/cell),gnx-1);
-      r[2]=cl((int)std::floor((m.bmin[1]-oy)/cell),gny-1); r[3]=cl((int)std::floor((m.bmax[1]-oy)/cell),gny-1);
-      r[4]=cl((int)std::floor((m.bmin[2]-oz)/cell),gnz-1); r[5]=cl((int)std::floor((m.bmax[2]-oz)/cell),gnz-1);
+    // span = the inclusive [x0,x1, y0,y1, z0,z1] grid-cell range a move's swept bbox
+    // overlaps. Build the CSR in two passes: count per cell, prefix-sum into offsets,
+    // then scatter move indices with a per-cell write cursor.
+    auto clampIdx = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
+    auto cellSpan = [&](const MV &m, int *span) {
+      span[0]=clampIdx((int)std::floor((m.bmin[0]-ox)/cell),gnx-1); span[1]=clampIdx((int)std::floor((m.bmax[0]-ox)/cell),gnx-1);
+      span[2]=clampIdx((int)std::floor((m.bmin[1]-oy)/cell),gny-1); span[3]=clampIdx((int)std::floor((m.bmax[1]-oy)/cell),gny-1);
+      span[4]=clampIdx((int)std::floor((m.bmin[2]-oz)/cell),gnz-1); span[5]=clampIdx((int)std::floor((m.bmax[2]-oz)/cell),gnz-1);
     };
     std::vector<uint32_t> counts(nCells, 0);
-    for (auto &m : ms) { int r[6]; range(m,r);
-      for (int z=r[4];z<=r[5];z++) for (int y=r[2];y<=r[3];y++) for (int x=r[0];x<=r[1];x++)
+    for (auto &m : ms) { int span[6]; cellSpan(m, span);
+      for (int z=span[4];z<=span[5];z++) for (int y=span[2];y<=span[3];y++) for (int x=span[0];x<=span[1];x++)
         counts[((size_t)z*gny+y)*gnx+x]++; }
     cellStartData.resize(nCells + 1); cellStartData[0] = 0;
     for (size_t c = 0; c < nCells; c++) cellStartData[c+1] = cellStartData[c] + counts[c];
     cellMovesData.resize(cellStartData[nCells]);
-    std::vector<uint32_t> cur(cellStartData.begin(), cellStartData.end()-1);
-    for (int mi = 0; mi < nMovesV; mi++) { int r[6]; range(ms[mi],r);
-      for (int z=r[4];z<=r[5];z++) for (int y=r[2];y<=r[3];y++) for (int x=r[0];x<=r[1];x++)
-        cellMovesData[cur[((size_t)z*gny+y)*gnx+x]++] = (uint32_t)mi; }
+    std::vector<uint32_t> cursor(cellStartData.begin(), cellStartData.end()-1);
+    for (int mi = 0; mi < nMovesV; mi++) { int span[6]; cellSpan(ms[mi], span);
+      for (int z=span[4];z<=span[5];z++) for (int y=span[2];y<=span[3];y++) for (int x=span[0];x<=span[1];x++)
+        cellMovesData[cursor[((size_t)z*gny+y)*gnx+x]++] = (uint32_t)mi; }
 
     val o = val::object();
     o.set("toolpath", tpJson);
