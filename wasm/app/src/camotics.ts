@@ -76,12 +76,43 @@ export function getModule(): Promise<CamModule> {
   return modulePromise;
 }
 
+// An explicit stock box (mm) for an editable workpiece; omit for auto-fit bounds.
+export interface Bounds {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+// A full CAMotics project (.camotics JSON) carries the real tool table + workpiece +
+// resolution; pass it so the wasm loads tools the raw G-code doesn't define.
+export interface ProjectInput {
+  json: string; // serialized .camotics
+  gcodeName: string; // basename the project's files[] references
+}
+export interface RenderOpts {
+  bounds?: Bounds; // explicit stock box (raw-gcode editable workpiece)
+  project?: ProjectInput; // load as a project (tools/bounds/resolution from JSON)
+}
+
+// Spread a Bounds into the 7 wasm args (useBox + min[3] + max[3]); auto when absent.
+function boxArgs(b?: Bounds): [boolean, number, number, number, number, number, number] {
+  return b
+    ? [true, b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]]
+    : [false, 0, 0, 0, 0, 0, 0];
+}
+// projectJson + gcodeName (empty = raw G-code path).
+function projArgs(p?: ProjectInput): [string, string] {
+  return p ? [p.json, p.gcodeName] : ['', ''];
+}
+
 // Simulate G-code in wasm -> final surface mesh + toolpath. resMode 1/2/3.
-export async function simulate(text: string, resMode: number): Promise<SimResult> {
+export async function simulate(
+  text: string,
+  resMode: number,
+  opts: RenderOpts = {}
+): Promise<SimResult> {
   const mod = await getModule();
   const sim = new mod.Sim();
   try {
-    sim.run(text, resMode); // <-- CAMotics core (wasm): toolpath + surface
+    sim.run(text, resMode, ...boxArgs(opts.bounds), ...projArgs(opts.project)); // CAMotics core (wasm)
     const toolpath = JSON.parse(sim.toolpathJSON()) as ToolPath;
     // positions()/normals() are VIEWS into the wasm heap — copy before delete().
     const positions = sim.positions().slice() as Float32Array;
@@ -95,11 +126,15 @@ export async function simulate(text: string, resMode: number): Promise<SimResult
 
 // Bake the analytic cut data (moves + tools + grid CSR) for the GPU swept-volume
 // SDF renderer. Typed-array members are heap VIEWS — copy out before delete().
-export async function bakeCut(text: string, resMode: number): Promise<CutData> {
+export async function bakeCut(
+  text: string,
+  resMode: number,
+  opts: RenderOpts = {}
+): Promise<CutData> {
   const mod = await getModule();
   const sim = new mod.Sim();
   try {
-    const r = sim.bakeCut(text, resMode);
+    const r = sim.bakeCut(text, resMode, ...boxArgs(opts.bounds), ...projArgs(opts.project));
     return {
       toolpath: JSON.parse(r.toolpath) as ToolPath,
       duration: r.duration as number,

@@ -68,8 +68,7 @@ def main():
         pg.on("console", lambda mm: errs.append("console:" + mm.text) if mm.type == "error" else None)
         pg.goto(f"http://127.0.0.1:{port}/index.html")
         pg.wait_for_function("window.__viewer && window.__viewer.ready===true", timeout=60000)
-        pg.evaluate("""(ex)=>{const s=document.getElementById('examples');s.value=ex;
-            s.dispatchEvent(new Event('change',{bubbles:true}));}""", EXAMPLE)
+        pg.evaluate("(ex)=>window.__loadExample(ex)", EXAMPLE)
         pg.wait_for_function("window.__viewer && window.__viewer.ready===true", timeout=60000)
         pg.wait_for_timeout(400)
 
@@ -79,8 +78,7 @@ def main():
         check("duration > 0", dur and dur > 0)
 
         # hide the toolpath/marker so the diff measures the SURFACE only
-        pg.evaluate("""()=>{const c=document.getElementById('show-path');
-            if(c.checked){c.click();}}""")
+        pg.evaluate("()=>{window.__viewer.setShowPath(false);window.__viewer.setShowTool(false);}")
         pg.wait_for_timeout(150)
 
         fracs = [i / 20 for i in range(21)]  # 0.00 .. 1.00 in 0.05 steps
@@ -140,8 +138,7 @@ def main():
         # NOT remove material -> the shaft rendered as a solid block (flat, low
         # contrast). Correct removal carves recessed channels -> high within-part
         # luma contrast. Assert the steep cuts actually carved material.
-        pg.evaluate("""(ex)=>{const s=document.getElementById('examples');s.value=ex;
-            s.dispatchEvent(new Event('change',{bubbles:true}));}""", "slant_test.nc")
+        pg.evaluate("(ex)=>window.__loadExample(ex)", "slant_test.nc")
         pg.wait_for_function("window.__viewer && window.__viewer.ready===true", timeout=60000)
         pg.evaluate("()=>window.__viewer.setTime(window.__viewer.getDuration())")
         pg.wait_for_timeout(500)

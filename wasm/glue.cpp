@@ -24,6 +24,8 @@
 
 #include <cbang/SmartPointer.h>
 #include <cbang/Exception.h>
+#include <cbang/json/Reader.h>
+#include <cbang/json/Value.h>
 
 #include <gcode/ToolShape.h>
 
@@ -119,25 +121,60 @@ class Sim {
   double gOrigin[3] = {0, 0, 0};
   double gCell = 0;
 
+private:
+  // Build the project from either a .camotics project JSON (real tool table +
+  // workpiece + resolution — the tools live in the project, NOT the G-code) or raw
+  // G-code (default tools, auto workpiece). For the project path the G-code is written
+  // under the basename the project's files[] references so it resolves on MEMFS.
+  void setupProject(Project::Project &project, const string &gcode, int resMode,
+                    const string &projectJson, const string &gcodeName) {
+    (void)gcodeName;
+    writeGCode(gcode);
+    project.addFile("/input.ngc");
+    if (projectJson.empty()) {
+      project.setResolutionMode(resModeFromInt(resMode));
+      return;
+    }
+    // Apply the .camotics project's tool table + workpiece + resolution. The tool
+    // GEOMETRY lives in the project, not the G-code, so without this the cut uses
+    // default tools. We parse the JSON directly (mirroring Project::read) and feed
+    // the G-code via addFile, rather than project.load() — which would try to
+    // resolve the project's files[] against a MEMFS directory and fail.
+    { ofstream f("/sim.camotics"); f << projectJson; }
+    SmartPointer<JSON::Value> doc = JSON::Reader::parseFile("/sim.camotics");
+    if (doc->has("tools")) project.getTools().read(*doc->get("tools"));
+    if (doc->has("workpiece")) project.getWorkpiece().read(*doc->get("workpiece"));
+    project.setResolutionMode(
+        ResolutionMode::parse(doc->getString("resolution-mode", "medium")));
+    if (doc->has("resolution")) project.setResolution(doc->getNumber("resolution", 1));
+  }
+
 public:
-  // resMode: 1=low 2=medium 3=high 4=very-high. Throws on bad G-code.
-  void run(string gcode, int resMode) {
+  // resMode: 1=low 2=medium 3=high 4=very-high. Throws on bad G-code. When useBox
+  // is true the stock is the explicit [min,max] box (editable workpiece); otherwise
+  // it's auto-fit to the toolpath. projectJson (+ gcodeName) loads a full .camotics
+  // project (real tools/bounds/resolution); empty projectJson = raw G-code.
+  void run(string gcode, int resMode, bool useBox,
+           double minx, double miny, double minz,
+           double maxx, double maxy, double maxz,
+           string projectJson, string gcodeName) {
     tpJson.clear(); verts.clear(); norms.clear(); tris = 0; durationS = 0;
 
-    writeGCode(gcode);
     Project::Project project;
-    project.addFile("/input.ngc");
-    project.setResolutionMode(resModeFromInt(resMode));
+    setupProject(project, gcode, resMode, projectJson, gcodeName);
 
     CutSim cutSim;
     SmartPointer<GCode::ToolPath> path = cutSim.computeToolPath(project);
     durationS = path->getTime();
 
-    // Auto-compute the workpiece bounds from the path BEFORE reading bounds/
-    // resolution (raw .nc has an automatic workpiece that is empty until update).
-    // This also populates the tool table, so toolpathToJSON must run AFTER it
-    // (else "tools" serializes empty -> marker Ø fallback + dashboard "--").
+    // update() auto-fits bounds from the path; it self-guards on isAutomatic() so a
+    // project with explicit bounds keeps them. Tools come from the project table.
     project.getWorkpiece().update(*path);
+    if (useBox) {
+      project.getWorkpiece().setAutomatic(false);
+      project.getWorkpiece().setBounds(
+          Rectangle3D(Vector3D(minx, miny, minz), Vector3D(maxx, maxy, maxz)));
+    }
     tpJson = toolpathToJSON(*path);
     Rectangle3D bounds = project.getWorkpiece().getBounds();
     double resolution = project.getResolution();
@@ -156,21 +193,27 @@ public:
 
   // Export analytic cut data: moves + tool table + uniform-grid CSR. The GPU
   // evaluates solid = max(stockSDF, -min over time-gated moves of swept-tool dist).
-  val bakeCut(string gcode, int resMode) {
+  // useBox / box doubles: see run() — an explicit stock box for an editable workpiece.
+  val bakeCut(string gcode, int resMode, bool useBox,
+              double minx, double miny, double minz,
+              double maxx, double maxy, double maxz,
+              string projectJson, string gcodeName) {
     movesData.clear(); toolsData.clear();
     cellStartData.clear(); cellMovesData.clear();
 
-    writeGCode(gcode);
     Project::Project project;
-    project.addFile("/input.ngc");
-    project.setResolutionMode(resModeFromInt(resMode));
+    setupProject(project, gcode, resMode, projectJson, gcodeName);
 
     CutSim cutSim;
     SmartPointer<GCode::ToolPath> path = cutSim.computeToolPath(project);
-    // update() before toolpathToJSON: the tool table isn't populated until the
-    // workpiece update, so serializing earlier emits an empty "tools" map (which
-    // made the marker fall back to Ø3 and the dashboard show "--").
+    // update() auto-fits bounds (self-guards on isAutomatic so a project keeps its
+    // explicit bounds). Tools come from the project table -> correct geometry.
     project.getWorkpiece().update(*path);
+    if (useBox) {
+      project.getWorkpiece().setAutomatic(false);
+      project.getWorkpiece().setBounds(
+          Rectangle3D(Vector3D(minx, miny, minz), Vector3D(maxx, maxy, maxz)));
+    }
     tpJson = toolpathToJSON(*path);
     double duration = path->getTime();
     durationS = duration;

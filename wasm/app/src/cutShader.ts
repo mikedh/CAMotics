@@ -39,9 +39,16 @@ export const cutFragmentShader = /* glsl */ `
 precision highp float;
 precision highp int;
 precision highp sampler2D;
+precision highp sampler3D;
 
-in vec3 vLocal;
+#ifdef BAKE
+uniform int  u_bakeLayer;   // local Z layer (0..D-1) of the keyframe being baked
+uniform vec2 u_bakeRes;     // field W,H (one slice, in texels)
+uniform vec2 u_tileOrigin;  // this slice's origin in the atlas (texels)
+#else
+in vec3 vLocal;             // box object-space pos (from the vertex stage)
 in vec3 vCamLocal;
+#endif
 out vec4 fragColor;
 
 uniform sampler2D u_moves;
@@ -68,6 +75,22 @@ uniform float u_tolerance;     // erode the solid by this (mm): solid features t
                                // than ~2x it snap away (clean near-breakthroughs)
 uniform float u_pixelWorld;    // world units / pixel / unit ray-distance = 2*tan(fovY/2)/Hpx
 uniform vec3  u_clearColor;    // background color, for analytic silhouette coverage AA
+
+// --- keyframe (checkpoint) fields: bake periodic full-state SDF snapshots, render the
+// nearest one + only the moves since it. u_useKF gates the whole feature (off = exact
+// original analytic path). The K fields are stacked in Z (texture depth = D*K).
+uniform sampler2D u_keyframe;    // RGBA8 atlas of K*D field slices (RG = 16-bit packed SDF)
+uniform sampler2D u_cellKfStart; // per-cell, per-checkpoint CSR start index (nCells*K)
+uniform int   u_ckTexW;
+uniform bool  u_useKF;
+uniform int   u_kfIndex;         // active keyframe = largest k with t_k <= scrub
+uniform int   u_kfCount;         // K
+uniform int   u_kfDepth;         // D field slices (Z) per keyframe
+uniform int   u_kfW;             // field slice width / height (texels)
+uniform int   u_kfH;
+uniform int   u_kfCols;          // atlas columns (slices laid out left-to-right, top-down)
+uniform float u_kfRange;         // SDF encode half-range (mm); values clamp to [-range,range]
+uniform float u_kfVoxel;         // world size of a field voxel (gradient step)
 
 // three.js injects these into the vertex stage only; declare them here so the
 // fragment shader can map the SDF hit point to depth (uniforms are program-wide).
@@ -185,12 +208,17 @@ vec3 toolNormal(vec3 p, vec3 a, vec3 b, vec4 tool) {
   return vec3(0.0, 0.0, 1.0);                       // on the floor/cap
 }
 
-// CSR [start, end) range of move indices binned into p's grid cell.
-ivec2 cellMoveRange(vec3 p) {
+// CSR [start, end) range of move indices for p's grid cell. With keyframes active the
+// start jumps PAST the moves already folded into the active keyframe (the per-cell
+// checkpoint offset) so we only scan the delta moves; otherwise it's the full cell list.
+ivec2 cellRange(vec3 p) {
   ivec3 c = clamp(ivec3(floor((p - u_gridOrigin) / u_gridCell)), ivec3(0), u_gridDims - 1);
   int lin = (c.z * u_gridDims.y + c.y) * u_gridDims.x + c.x;
-  return ivec2(int(fetch(u_cellStart, lin,     u_startTexW).x + 0.5),
-               int(fetch(u_cellStart, lin + 1, u_startTexW).x + 0.5));
+  int end = int(fetch(u_cellStart, lin + 1, u_startTexW).x + 0.5);
+  int start = u_useKF
+    ? int(fetch(u_cellKfStart, lin * u_kfCount + u_kfIndex, u_ckTexW).x + 0.5)
+    : int(fetch(u_cellStart, lin, u_startTexW).x + 0.5);
+  return ivec2(start, end);
 }
 
 // One move resolved at the current scrub time: segment endpoints (the end clipped
@@ -222,7 +250,7 @@ SweptMove loadMove(int csrIndex) {
 // removed region). Only the moves in p's grid cell are tested; the cell list is
 // sorted by start time, so we stop at the first move not yet started.
 float cutDist(vec3 p) {
-  ivec2 range = cellMoveRange(p);
+  ivec2 range = cellRange(p);
   float d = 1e9;
   for (int k = 0; k < MAX_PER_CELL; k++) {
     int j = range.x + k;
@@ -239,7 +267,7 @@ float cutDist(vec3 p) {
 // the distance lets hitNormal reuse it for the box-vs-cut decision instead of a
 // separate cutDist() scan. Only run at the hit (once/pixel).
 vec4 cutNormal(vec3 p) {
-  ivec2 range = cellMoveRange(p);
+  ivec2 range = cellRange(p);
   float best = 1e9;
   vec3 n = vec3(0.0, 0.0, 1.0);
   for (int k = 0; k < MAX_PER_CELL; k++) {
@@ -258,8 +286,83 @@ float boxSDF(vec3 p) {
   return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
-// Cut workpiece SDF: inside stock AND outside every cut. <0 == solid.
-float sceneSDF(vec3 p) { return max(boxSDF(p), -cutDist(p)); }
+// SDF <-> RGBA8 packing: 16-bit fixed point (R = high byte, G = low byte) over the
+// clamped range [-u_kfRange, u_kfRange]. Lets the bulk field live in a universally
+// renderable RGBA8 atlas (no float render targets needed).
+vec4 kfEncode(float sdf) {
+  float s = clamp(sdf / (2.0 * u_kfRange) + 0.5, 0.0, 1.0) * 65535.0;
+  float hi = floor(s / 256.0);
+  return vec4(hi / 255.0, (s - hi * 256.0) / 255.0, 0.0, 1.0);
+}
+float kfDecode(vec4 t) {
+  float hi = floor(t.r * 255.0 + 0.5), lo = floor(t.g * 255.0 + 0.5);
+  return ((hi * 256.0 + lo) / 65535.0 - 0.5) * 2.0 * u_kfRange;
+}
+// Bilinear-decode one atlas slice at field coords fxy (texels), clamped inside its tile.
+float kfSlice(int slice, vec2 fxy) {
+  ivec2 org = ivec2((slice % u_kfCols) * u_kfW, (slice / u_kfCols) * u_kfH);
+  vec2 q = clamp(fxy, vec2(0.5), vec2(float(u_kfW) - 0.5, float(u_kfH) - 0.5)) - 0.5;
+  ivec2 i0 = ivec2(floor(q));
+  vec2 fr = q - vec2(i0);
+  float d00 = kfDecode(texelFetch(u_keyframe, org + i0, 0));
+  float d10 = kfDecode(texelFetch(u_keyframe, org + i0 + ivec2(1, 0), 0));
+  float d01 = kfDecode(texelFetch(u_keyframe, org + i0 + ivec2(0, 1), 0));
+  float d11 = kfDecode(texelFetch(u_keyframe, org + i0 + ivec2(1, 1), 0));
+  return mix(mix(d00, d10, fr.x), mix(d01, d11, fr.x), fr.y);
+}
+// Trilinear sample of the active keyframe's solid SDF at raw point p (manual: NearestFilter
+// atlas + bilinear-in-slice + lerp across the two bracketing Z slices, all within keyframe).
+float sampleKF(vec3 p) {
+  vec3 f = clamp((p - u_stockMin) / max(u_stockMax - u_stockMin, vec3(1e-6)), 0.0, 1.0);
+  vec2 fxy = f.xy * vec2(float(u_kfW), float(u_kfH));
+  float fz = f.z * (float(u_kfDepth) - 1.0);
+  int z0 = int(floor(fz)), z1 = min(z0 + 1, u_kfDepth - 1);
+  int base = u_kfIndex * u_kfDepth;
+  return mix(kfSlice(base + z0, fxy), kfSlice(base + z1, fxy), fz - float(z0));
+}
+// Octahedral unit-normal packing into 2 bytes (atlas B,A) so keyframe surfaces carry the
+// real ANALYTIC normal baked in — crisp creases — instead of a smeared field gradient.
+vec2 octEncode(vec3 n) {
+  n /= (abs(n.x) + abs(n.y) + abs(n.z));
+  vec2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+  return e * 0.5 + 0.5;
+}
+vec3 octDecode(vec2 e) {
+  e = e * 2.0 - 1.0;
+  vec3 n = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+  float t = max(-n.z, 0.0);
+  n.x += n.x >= 0.0 ? -t : t;
+  n.y += n.y >= 0.0 ? -t : t;
+  return normalize(n);
+}
+// Bilinear-decode the baked normal (B,A channels) of one atlas slice at field coords fxy.
+vec3 kfSliceN(int slice, vec2 fxy) {
+  ivec2 org = ivec2((slice % u_kfCols) * u_kfW, (slice / u_kfCols) * u_kfH);
+  vec2 q = clamp(fxy, vec2(0.5), vec2(float(u_kfW) - 0.5, float(u_kfH) - 0.5)) - 0.5;
+  ivec2 i0 = ivec2(floor(q));
+  vec2 fr = q - vec2(i0);
+  vec3 n00 = octDecode(texelFetch(u_keyframe, org + i0, 0).ba);
+  vec3 n10 = octDecode(texelFetch(u_keyframe, org + i0 + ivec2(1, 0), 0).ba);
+  vec3 n01 = octDecode(texelFetch(u_keyframe, org + i0 + ivec2(0, 1), 0).ba);
+  vec3 n11 = octDecode(texelFetch(u_keyframe, org + i0 + ivec2(1, 1), 0).ba);
+  return mix(mix(n00, n10, fr.x), mix(n01, n11, fr.x), fr.y);
+}
+// Keyframe-surface normal = the baked analytic normal (crisp), sampled like sampleKF.
+vec3 kfNormal(vec3 p) {
+  vec3 f = clamp((p - u_stockMin) / max(u_stockMax - u_stockMin, vec3(1e-6)), 0.0, 1.0);
+  vec2 fxy = f.xy * vec2(float(u_kfW), float(u_kfH));
+  float fz = f.z * (float(u_kfDepth) - 1.0);
+  int z0 = int(floor(fz)), z1 = min(z0 + 1, u_kfDepth - 1);
+  int base = u_kfIndex * u_kfDepth;
+  return normalize(mix(kfSliceN(base + z0, fxy), kfSliceN(base + z1, fxy), fz - float(z0)));
+}
+
+// Cut workpiece SDF: inside stock AND outside every cut. <0 == solid. With keyframes
+// active, the stock + all cuts up to the active checkpoint come from the field sample
+// and cutDist scans only the delta moves since then (see cellRange).
+float sceneSDF(vec3 p) {
+  return u_useKF ? max(sampleKF(p), -cutDist(p)) : max(boxSDF(p), -cutDist(p));
+}
 
 // Analytic outward normal of the stock box face nearest p (exact, sharp corners).
 vec3 boxNormal(vec3 p) {
@@ -279,8 +382,13 @@ vec3 boxNormal(vec3 p) {
 // vs floor-up), so an unbiased pick flickers per-pixel -> haze. Bias toward the
 // cut floor (what you actually see from above) so it renders consistently.
 vec3 hitNormal(vec3 p) {
-  vec4 cn = cutNormal(p);   // .xyz = cut normal, .w = nearest cut distance (reused below)
-  return (boxSDF(p) > -cn.w + u_featureScale * 0.03) ? boxNormal(p) : cn.xyz;
+  vec4 cn = cutNormal(p);   // .xyz = cut normal, .w = nearest (delta) cut distance
+  // base = the box (analytic) or the keyframe field, whichever this mode uses. If it
+  // binds over the delta cut, use its normal (box face / field gradient); else the
+  // active tool's analytic wall/floor normal.
+  float base = u_useKF ? sampleKF(p) : boxSDF(p);
+  if (base > -cn.w + u_featureScale * 0.03) return u_useKF ? kfNormal(p) : boxNormal(p);
+  return cn.xyz;
 }
 
 vec2 hitBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi) {
@@ -329,6 +437,23 @@ vec3 shade(vec3 n, vec3 rd, float ao) {
   return u_baseColor * diff + vec3(spec);
 }
 
+#ifdef BAKE
+// Bake pass: evaluate the analytic solid SDF at this voxel's center (XY from the
+// fragment, Z from the layer) and store it into the keyframe field. The bake material
+// sets u_useKF=false + u_scrubAbs=t_k, so cutDist scans ALL moves up to the checkpoint.
+void main() {
+  vec2 f = (gl_FragCoord.xy - u_tileOrigin) / u_bakeRes;  // [0,1] within this slice's tile
+  float z = (float(u_bakeLayer) + 0.5) / float(u_kfDepth);
+  vec3 p = mix(u_stockMin, u_stockMax, vec3(f, z));
+  // ONE cell scan: cutNormal returns the nearest cut's analytic normal (.xyz) AND its
+  // distance (.w), so we get both the SDF and a crisp baked normal without a 2nd scan.
+  vec4 cn = cutNormal(p);
+  float bx = boxSDF(p);
+  vec3 nrm = (bx > -cn.w + u_featureScale * 0.03) ? boxNormal(p) : cn.xyz;  // = hitNormal logic
+  vec4 d = kfEncode(max(bx, -cn.w));    // R,G = 16-bit distance
+  fragColor = vec4(d.r, d.g, octEncode(nrm));  // B,A = baked analytic normal
+}
+#else
 void main() {
   vec3 ro = vCamLocal + u_stockCenter;             // camera, raw coords
   vec3 rd = normalize(vLocal - vCamLocal);         // ray dir (translation free)
@@ -408,4 +533,10 @@ void main() {
   }
   discard;
 }
+#endif
+`;
+
+// Fullscreen-triangle vertex shader for the keyframe bake pass (clip-space quad).
+export const bakeVertexShader = /* glsl */ `
+void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
 `;
