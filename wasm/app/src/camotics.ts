@@ -11,7 +11,7 @@ import createCAMotics from './wasm/camotics.js';
 // Parcel rewrites this to the hashed/served asset URL for the .wasm file.
 const wasmUrl = new URL('./wasm/camotics.wasm', import.meta.url).href;
 
-// --- ToolPath JSON shape (from toolpathJSON / loadGCode) --------------------
+// --- ToolPath JSON shape (from Sim::toolpathJSON) ---------------------------
 export interface Move {
   type: 'rapid' | 'cut';
   start: [number, number, number];
@@ -74,12 +74,6 @@ export function getModule(): Promise<CamModule> {
     });
   }
   return modulePromise;
-}
-
-// Toolpath-only (no surface mesh). Kept for parity with the vanilla __loadGCode.
-export async function loadGCode(text: string): Promise<ToolPath> {
-  const mod = await getModule();
-  return JSON.parse(mod.loadGCode(text)) as ToolPath;
 }
 
 // Simulate G-code in wasm -> final surface mesh + toolpath. resMode 1/2/3.

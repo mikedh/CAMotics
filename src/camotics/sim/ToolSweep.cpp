@@ -135,40 +135,6 @@ double ToolSweep::depth(const Vector3D &p) const {
 }
 
 
-double ToolSweep::getRemovalTime(const Vector3D &p) const {
-  vector<const GCode::Move *> moves;
-  collisions(p, moves);
-
-  // Earliest moves first; the first whose sweep contains p removed it.
-  sort(moves.begin(), moves.end(), move_sort());
-
-  for (unsigned i = 0; i < moves.size(); i++) {
-    const GCode::Move &move = *moves[i];
-    int tool = move.getTool();
-    if (tool < 0 || (unsigned)tool >= sweeps.size() || sweeps[tool].isNull())
-      continue;
-
-    // Test against this move's full swept volume (its own endpoints).
-    const Vector3D &a = move.getStartPt();
-    const Vector3D &b = move.getEndPt();
-    if (sweeps[tool]->depth(a, b, p) < 0) continue; // p not inside this sweep
-
-    // Refine to a sub-move time by projecting p onto the move segment a->b, so
-    // the removal-time field varies smoothly along the cut (smooth frontier).
-    double abx = b.x() - a.x(), aby = b.y() - a.y(), abz = b.z() - a.z();
-    double L2 = abx * abx + aby * aby + abz * abz;
-    double f = 0;
-    if (1e-12 < L2)
-      f = ((p.x() - a.x()) * abx + (p.y() - a.y()) * aby +
-           (p.z() - a.z()) * abz) / L2;
-    f = f < 0 ? 0 : (1 < f ? 1 : f);
-    return move.getStartTime() + f * move.getTime();
-  }
-
-  return numeric_limits<double>::max(); // never removed
-}
-
-
 SmartPointer<Sweep> ToolSweep::getSweep(const GCode::Tool &tool) {
   switch (tool.getShape()) {
   case GCode::ToolShape::TS_CYLINDRICAL:

@@ -58,11 +58,6 @@ namespace CAMotics {
     void setChange(const cb::SmartPointer<MoveLookup> &change)
     {this->change = change;}
 
-    // Earliest time material at p was removed by any move's sweep (over the
-    // sweep's full move set), or +inf if never removed. Used to bake a per-voxel
-    // removal-time field for GPU time-scrubbing.
-    double getRemovalTime(const cb::Vector3D &p) const;
-
     // From FieldFunction
     bool cull(const cb::Rectangle3D &r) const override;
     double depth(const cb::Vector3D &p) const override;

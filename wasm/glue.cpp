@@ -1,8 +1,7 @@
 /*
   glue.cpp — Emscripten/embind entry point for the in-browser CAMotics core.
   No GUI, no TPL/V8, no networking. Loads raw G-code via Project::addFile (avoids
-  XML/expat at runtime). Two entry points:
-    - loadGCode(text)            : ToolPath JSON only (fast, path-only viewer).
+  XML/expat at runtime). Entry point:
     - class Sim                  : ToolPath JSON + the simulated cut SURFACE mesh
                                    (marching cubes). Runs single-threaded
                                    (threads=1) so it works without -pthread;
@@ -15,12 +14,9 @@
 #include <camotics/project/ResolutionMode.h>
 #include <camotics/sim/CutSim.h>
 #include <camotics/sim/Simulation.h>
-#include <camotics/sim/ToolSweep.h>
-#include <camotics/sim/CutWorkpiece.h>
 #include <camotics/sim/Workpiece.h>
 #include <camotics/render/RenderMode.h>
 #include <camotics/contour/Surface.h>
-#include <camotics/Grid.h>
 
 #include <gcode/ToolPath.h>
 #include <gcode/Move.h>
@@ -93,16 +89,6 @@ static void writeGCode(const string &gcode) {
   f << gcode;
 }
 
-// Path-only entry: G-code text -> ToolPath JSON. Throws -> JS exception.
-static string loadGCode(string gcode) {
-  writeGCode(gcode);
-  Project::Project project;
-  project.addFile("/input.ngc");
-  CutSim cutSim;
-  SmartPointer<GCode::ToolPath> path = cutSim.computeToolPath(project);
-  return toolpathToJSON(*path);
-}
-
 static ResolutionMode resModeFromInt(int m) {
   switch (m) {
   case 1:  return ResolutionMode::RESOLUTION_LOW;
@@ -121,9 +107,6 @@ class Sim {
   unsigned tris = 0;
   double durationS = 0;
 
-  // Baked voxel field for GPU time-scrubbing: interleaved RG per voxel,
-  // R = final signed depth (>0 inside material), G = removalTime in (0,1] with
-  // sentinels 0 = outside stock (air), >1 = in-stock-never-cut (permanent).
   // Analytic cut export: moves (9 floats each), tool table (4 floats each), and a
   // uniform-grid CSR binning moves by their swept bbox -> the GPU evaluates the
   // cut as max(stockSDF, -min over time-gated moves of sweptToolDistance).
@@ -164,6 +147,7 @@ public:
 
     SmartPointer<Surface> surface = cutSim.computeSurface(sim);
     tris = (unsigned)surface->getTriangleCount();
+    verts.reserve((size_t)tris * 9); norms.reserve((size_t)tris * 9); // 3 verts * xyz
     surface->getVertices([this](const vector<float> &v, const vector<float> &n) {
       verts.insert(verts.end(), v.begin(), v.end());
       norms.insert(norms.end(), n.begin(), n.end());
@@ -218,8 +202,10 @@ public:
     // One move for export: `d` packs the 9 floats per move uploaded to the GPU move
     // texture — x0,y0,z0, x1,y1,z1, tStart, tEnd, toolIdx (so d[6] is tStart). bmin/
     // bmax is its swept-tool bounding box, used to bin it into the uniform grid.
-    struct MV { float d[9]; double bmin[3], bmax[3]; };
+    struct MV { float d[9]; float bmin[3], bmax[3]; };  // bbox is float: only used for
+                                                        // floor((bbox-o)/cell) grid binning
     std::vector<MV> ms;
+    ms.reserve(path->size());
     for (unsigned i = 0; i < path->size(); i++) {
       const Move &mv = (*path)[i];
       int tnum = mv.getTool();
@@ -247,14 +233,19 @@ public:
       ms.push_back(m);
     }
     nMovesV = (int)ms.size();
-    // Sort by tStart so each grid cell's CSR move list ends up tStart-ascending;
-    // the shader can then STOP scanning a cell once a move hasn't started yet
-    // (temporal pruning while scrubbing). The SDF is a min over moves, so order
-    // is otherwise irrelevant; the dashboard/path use the separate toolpath order.
-    std::stable_sort(ms.begin(), ms.end(),
-                     [](const MV &a, const MV &b){ return a.d[6] < b.d[6]; }); // by tStart
+    // Sort an INDEX array by tStart (cheap — vs churning the ~60-byte MV structs) so
+    // each grid cell's CSR list ends up tStart-ascending -> the shader stops scanning a
+    // cell once a move hasn't started (temporal pruning). The SDF is a min over moves,
+    // so order is otherwise irrelevant; the dashboard/path use the toolpath order.
+    std::vector<uint32_t> order(nMovesV);
+    for (int i = 0; i < nMovesV; i++) order[i] = (uint32_t)i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t a, uint32_t b){ return ms[a].d[6] < ms[b].d[6]; });
     movesData.reserve((size_t)nMovesV * 9);
-    for (auto &m : ms) for (int k = 0; k < 9; k++) movesData.push_back(m.d[k]);
+    for (int p = 0; p < nMovesV; p++) {
+      const MV &m = ms[order[p]];
+      for (int k = 0; k < 9; k++) movesData.push_back(m.d[k]);
+    }
 
     // Uniform grid over the stock bounds (padded by max tool radius).
     Vector3D mn = wb.getMin(), mx = wb.getMax();
@@ -286,9 +277,11 @@ public:
     for (size_t c = 0; c < nCells; c++) cellStartData[c+1] = cellStartData[c] + counts[c];
     cellMovesData.resize(cellStartData[nCells]);
     std::vector<uint32_t> cursor(cellStartData.begin(), cellStartData.end()-1);
-    for (int mi = 0; mi < nMovesV; mi++) { int span[6]; cellSpan(ms[mi], span);
+    // scatter in EXPORT order p (= tStart-ascending) so each cell's list stays sorted;
+    // store p, the move's index in movesData (built in the same order above).
+    for (int p = 0; p < nMovesV; p++) { int span[6]; cellSpan(ms[order[p]], span);
       for (int z=span[4];z<=span[5];z++) for (int y=span[2];y<=span[3];y++) for (int x=span[0];x<=span[1];x++)
-        cellMovesData[cursor[((size_t)z*gny+y)*gnx+x]++] = (uint32_t)mi; }
+        cellMovesData[cursor[((size_t)z*gny+y)*gnx+x]++] = (uint32_t)p; }
 
     val o = val::object();
     o.set("toolpath", tpJson);
@@ -317,8 +310,6 @@ public:
 };
 
 EMSCRIPTEN_BINDINGS(camotics) {
-  emscripten::function("loadGCode", &loadGCode);
-
   class_<Sim>("Sim")
     .constructor<>()
     .function("run",           &Sim::run)

@@ -43,9 +43,12 @@ with Playwright + headless Chromium.
 
 ## Layout
 - wasm/cbang/         cbang checkout + native build
-- wasm/viewer/        three.js frontend (index.html, app.js, vendor/, fixtures/)
-- wasm/e2e/           uv project, Playwright tests (test_viewer.py), serve via http
+- wasm/glue.cpp       embind entry (class Sim: run/bakeCut/toolpathJSON)
+- wasm/app/           parcel2 + preact + ts frontend (src/, examples/, tests/)
+- wasm/app/tests/     Playwright tests (test_cut.py, e2e_smoke.py, perf_cut.py)
 - wasm/*.log          background build/download logs
+(The early hand-vendored `wasm/viewer/` + `wasm/e2e/` + `wasm/path2json.cpp` were
+ removed once `wasm/app` superseded them — see "Fork-diff shrink" below.)
 
 ## Status log
 - [done] cloned cbang, installed scons via uv, proved Playwright+Chromium+WebGL
@@ -117,12 +120,12 @@ with Playwright + headless Chromium.
 - To view: `python3 wasm/serve_dev.py` then open http://localhost:8000
 
 ## [DONE v3] parcel2+preact+ts viewer + GPU time-scrub (two render modes)
-- Frontend migrated to parcel2 + preact + typescript under `wasm/app/` (the
-  vanilla `wasm/viewer/` is kept only for the legacy e2e). Build: `npm run build`
-  in wasm/app -> dist/. Serve no-cache: `python serve_dist.py` (or e2e servers).
+- Frontend migrated to parcel2 + preact + typescript under `wasm/app/`. Build:
+  `npm run build` in wasm/app -> dist/. Serve no-cache: `python serve_dist.py`.
 - Three render modes (toolbar "Render"): **Cut (analytic)** [default], **Volume
-  (field)**, **Mesh**. C++ edits -> `bash build_wasm.sh` then copy
-  `viewer/camotics.{js,wasm}` to `app/src/wasm/`, then `npm run build`.
+  (field)**, **Mesh** (Volume since removed; now Cut / Mesh). C++ edits ->
+  `uv run wasm/build_wasm.py` (links straight to `app/src/wasm/camotics.{js,wasm}`)
+  then `npm run build`.
 
 ### Cut (analytic) — squirm-free, crisp tool walls  [the v3 payoff]
 The voxel "removalTime" field (Volume mode) renders the level-set {g==scrubTime};
@@ -323,6 +326,32 @@ Both are shader+viewer only (no wasm rebuild) and mathematically identical (test
 dense tool table by move frequency (maximizes multi-tool skips); the per-move sign-bit
 flag already generalizes the mechanism.
 
+### Fork-diff shrink (keep the wasm-vs-master diff small + the C glue tight)
+The maintainer won't merge this, so minimize the diff vs `master` and the touched
+CORE files (easier to rebase the fork).
+- **Deleted the abandoned vanilla prototype** `wasm/viewer/` — it hand-vendored
+  `three.module.js` (53k lines) + OrbitControls + STLLoader + a duplicate examples
+  copy, all superseded by `wasm/app` (parcel pulls three from npm). Took its
+  viewer-only driver `wasm/e2e/`, the early native `wasm/path2json.cpp`, and
+  `wasm/serve_dev.py` with it. ~56k lines gone; `wasm/app` had zero dependency on it.
+- **Core `src/` footprint -> ONE file** (`render/Renderer.cpp`, the threads<=1 inline
+  patch). Reverted `sim/ToolSweep.{cpp,h}` to master: its `getRemovalTime` was dead
+  code left from the deleted Volume mode (no callers).
+- **Build consolidated** into ONE script `wasm/build_wasm.py` (was the bash
+  `build_wasm.sh` compile + the Python `fetch_deps.py` provisioning — now a single
+  `uv run wasm/build_wasm.py` with `--clean`/`--clean-all`/`--fetch-only`/`--serve`).
+  Provisions pinned deps + emsdk, compiles, and links straight to
+  `app/src/wasm/camotics.{js,wasm}` (no viewer copy step). Clean build verified
+  byte-identical to the bash build (309 objs, 0 FAILCOMPILE, cut 8/8 @ 22.3).
+- **MESH-mode coverage** (lost with `wasm/e2e`) folded into `app/tests/e2e_smoke.py`:
+  it now also drives `window.__simulate` and asserts a non-empty surface mesh.
+- **glue.cpp tightened** (minimal/careful allocation): dropped dead includes
+  (ToolSweep/CutWorkpiece/Grid) + the unused `loadGCode` entry; `run()` reserves
+  verts/norms from triangleCount; `bakeCut` reserves `ms`, shrank the per-move
+  `MV` bbox double->float (84->60 B), and sorts a uint32 INDEX array by tStart
+  (not the structs) before building movesData + the CSR. Render byte-identical
+  (cut 8/8, same 22.3 contrast).
+
 ## Remaining (future)
 - Dense-path perf (vcarve ~199 moves/cell): inherent overlap, not grid resolution.
   The correct SDF is heavier per move, so swiftshader vcarve is ~400ms (one full-res
@@ -356,24 +385,25 @@ flag already generalizes the mechanism.
    e2e (it's the contract) against wasm-produced data.
 
 ## Reproducible setup from a fresh clone
-fetch_deps.py is the orchestrator (fetch deps -> build wasm -> serve):
+build_wasm.py is the single orchestrator (provision deps -> compile+link -> serve):
 1. apt build deps (needs sudo):
    sudo apt-get install -y build-essential pkgconf libboost-dev \
      libboost-iostreams-dev libssl-dev libexpat1-dev zlib1g-dev libbz2-dev \
      liblz4-dev libsqlite3-dev libevent-dev libyaml-dev libre2-dev \
      libleveldb-dev libsnappy-dev
 2. scons:  uv tool install scons
-3. build+serve:  uv run wasm/fetch_deps.py --serve
+3. build+serve:  uv run wasm/build_wasm.py --serve
    # pins cbang/libexpat/emsdk by commit, patches out cbang V8, installs emsdk
    # 6.0.0, gens cbang/include headers, builds wasm, serves on 0.0.0.0:8000
-   flags: --clean (wipe build outputs + rebuild), --clean-all (also re-fetch deps,
-          ~1.5G), --fetch-only, --serve, --port N
+   flags: --clean (wipe build objects + outputs, rebuild), --clean-all (also re-fetch
+          deps, ~1.5G), --fetch-only, --serve, --port N
 (cbang/, emsdk/, libexpat/, wobj/ gitignored — step 3 regenerates them. Idempotent.)
 
 ## Key commands
 - env:   export PATH="$HOME/.local/bin:$PATH"; export CBANG_HOME=$PWD/wasm/cbang
 - core:  scons with_gui=0 with_tpl=0 -j4
 - sim:   ./camsim --resolution low examples/aztec_calendar/aztec_calendar.camotics out.stl
-- path:  (cd examples/aztec_calendar && .../wasm/path2json aztec_calendar.camotics out.json)
-- e2e:   cd wasm/e2e && uv run --active python test_viewer.py   (system chromium)
+- wasm:  uv run wasm/build_wasm.py      (-> wasm/app/src/wasm/camotics.{js,wasm})
+- app:   (cd wasm/app && npm run build && python serve_dist.py)
+- e2e:   (cd wasm/app && uv run --with playwright,pillow python tests/e2e_smoke.py)
 - emcc:  source wasm/emsdk/emsdk_env.sh   (emcc 6.0.0)
