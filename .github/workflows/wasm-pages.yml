@@ -22,31 +22,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install apt build deps   # needed for cbang's native scons build
-        # NB: deliberately NOT installing libre2-dev / libyaml-dev / libsqlite3-dev /
-        # libbz2-dev / liblz4-dev. cbang only vendors those headers into include/
-        # (which the wasm build #includes) when it builds its BUNDLED copy, and it
-        # skips that whenever the system -dev package is found. build_wasm.py forces
-        # them local regardless, but leaving the packages out keeps CI honest and
-        # matches the dev setup that this was tested against.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkgconf \
-            libboost-dev libboost-iostreams-dev libssl-dev libexpat1-dev \
-            zlib1g-dev libevent-dev libleveldb-dev libsnappy-dev
-
+      # No apt build deps and no scons: the wasm build runs entirely on the emscripten
+      # toolchain. cbang's native scons build was removed (it only existed to vendor
+      # re2/yaml headers); build_wasm.py now writes cbang/include/cbang/config.h directly
+      # and uses a std::regex shim instead of re2. Node (for emscripten + the parcel app)
+      # comes from setup-node; python/uv from setup-uv.
       - uses: astral-sh/setup-uv@v5
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install scons
-        run: |
-          uv tool install scons
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"   # build script uses shutil.which("scons")
-
-      - name: Cache wasm toolchain + deps   # emsdk ~1.5G, native-built cbang, libexpat
+      - name: Cache wasm toolchain + deps   # emsdk ~1.5G + downloaded cbang/libexpat sources
         uses: actions/cache@v4
         with:
           path: |
