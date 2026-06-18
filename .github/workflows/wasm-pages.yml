@@ -23,12 +23,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install apt build deps   # needed for cbang's native scons build
+        # NB: deliberately NOT installing libre2-dev / libyaml-dev / libsqlite3-dev /
+        # libbz2-dev / liblz4-dev. cbang only vendors those headers into include/
+        # (which the wasm build #includes) when it builds its BUNDLED copy, and it
+        # skips that whenever the system -dev package is found. build_wasm.py forces
+        # them local regardless, but leaving the packages out keeps CI honest and
+        # matches the dev setup that this was tested against.
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkgconf \
             libboost-dev libboost-iostreams-dev libssl-dev libexpat1-dev \
-            zlib1g-dev libbz2-dev liblz4-dev libsqlite3-dev libevent-dev \
-            libyaml-dev libre2-dev libleveldb-dev libsnappy-dev
+            zlib1g-dev libevent-dev libleveldb-dev libsnappy-dev
 
       - uses: astral-sh/setup-uv@v5
 

@@ -99,6 +99,15 @@ def setup_emsdk(emsdk):
     subprocess.run([str(emsdk_bin), "activate", EMSDK_VERSION], cwd=emsdk, check=True)
 
 
+# Third-party libs cbang only vendors into include/ (re2/re2.h, yaml.h, bzlib.h,
+# sqlite3.h, lz4.h) when it builds its BUNDLED copy — which it skips whenever the
+# matching system -dev package is found. The wasm build #includes those bundled
+# headers, so force cbang to build them locally regardless of host packages;
+# otherwise CI (which has libre2-dev/libyaml-dev/... installed) generates none of
+# them and the build dies in verify_deps / the cbang compile.
+CBANG_FORCE_LOCAL = "bzip2 lz4 sqlite3 re2 libyaml"
+
+
 def build_cbang_native(cbang):
     # The wasm build includes cbang/include/* (re2/*.h, yaml.h, ...), which are
     # produced by cbang's native build — so build it once here.
@@ -110,7 +119,9 @@ def build_cbang_native(cbang):
         sys.exit("scons not found. Install it with:  uv tool install scons")
     log("cbang: building natively to generate include/ headers")
     env = dict(os.environ, CBANG_HOME=str(cbang))
-    rc = subprocess.run([scons, f"-j{os.cpu_count() or 4}"], cwd=cbang, env=env).returncode
+    rc = subprocess.run(
+        [scons, f"-j{os.cpu_count() or 4}", f"force_local={CBANG_FORCE_LOCAL}"],
+        cwd=cbang, env=env).returncode
     if rc != 0:
         sys.exit("cbang native build failed. Likely missing apt build deps:\n  " + APT_HINT)
 

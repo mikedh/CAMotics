@@ -386,7 +386,7 @@ function App() {
     <>
       <div id="toolbar">
         <span class="brand">
-          <span class="dot" /> CAMotics
+          <span class="dot" /> WAMotics
         </span>
         <span class="sep" />
 
